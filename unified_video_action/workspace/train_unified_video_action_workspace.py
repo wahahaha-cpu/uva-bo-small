@@ -18,9 +18,14 @@ import tqdm
 from torch.utils.data import DataLoader
 import numpy as np
 from accelerate import Accelerator
-from accelerate.utils import DeepSpeedPlugin, DistributedDataParallelKwargs
 import pickle
+from datetime import timedelta
 
+from accelerate.utils import (
+      DeepSpeedPlugin,
+      DistributedDataParallelKwargs,
+      InitProcessGroupKwargs,
+)
 from unified_video_action.workspace.base_workspace import BaseWorkspace
 from unified_video_action.policy.unified_video_action_policy import (
     UnifiedVideoActionPolicy,
@@ -36,6 +41,10 @@ from unified_video_action.eval.eval import test_video_fvd, test_action_l2
 from unified_video_action.utils.data_utils import resize_image
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
+
+timeout_kwargs = InitProcessGroupKwargs(
+      timeout=timedelta(hours=4)
+  )
 
 
 class TrainUnifiedVideoActionWorkspace(BaseWorkspace):
@@ -81,23 +90,30 @@ class TrainUnifiedVideoActionWorkspace(BaseWorkspace):
         
     def run(self):
         cfg = copy.deepcopy(self.cfg)
-        if (
-            "deepspeed_config" in cfg.training
-            and cfg.training.deepspeed_config is not None
-        ):
+        if ( "deepspeed_config" in cfg.training and cfg.training.deepspeed_config is not None):
             deepspeed_plugin = DeepSpeedPlugin(
                 hf_ds_config=cfg.training.deepspeed_config
             )
-            ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+
+            ddp_kwargs = DistributedDataParallelKwargs(
+                find_unused_parameters=True
+            )
+
             accelerator = Accelerator(
                 log_with="wandb",
                 mixed_precision=self.cfg.training.mixed_precision,
                 deepspeed_plugin=deepspeed_plugin,
-                kwargs_handlers=[ddp_kwargs],
+                kwargs_handlers=[ddp_kwargs, timeout_kwargs],
             )
         else:
+            ddp_kwargs = DistributedDataParallelKwargs(
+                find_unused_parameters=True
+            )
+
             accelerator = Accelerator(
-                log_with="wandb", mixed_precision=self.cfg.training.mixed_precision
+                log_with="wandb",
+                mixed_precision=self.cfg.training.mixed_precision,
+                kwargs_handlers=[ddp_kwargs, timeout_kwargs],
             )
 
         if accelerator.is_main_process:
@@ -193,12 +209,15 @@ class TrainUnifiedVideoActionWorkspace(BaseWorkspace):
             ema = hydra.utils.instantiate(cfg.ema, model=self.ema_model)
 
         # configure env
-        if (
-            cfg.model.policy.action_model_params.predict_action
-            and "env_runner" in cfg.task
-        ):
-            env_runners = load_env_runner(cfg, self.output_dir)
-
+        rollout_enabled = (
+              cfg.model.policy.action_model_params.predict_action
+              and "env_runner" in cfg.task
+        )
+        env_runners = None
+        if rollout_enabled:
+            if accelerator.is_main_process:
+                env_runners = load_env_runner(cfg, self.output_dir)
+            accelerator.wait_for_everyone()
         # configure checkpoint
         topk_manager = TopKCheckpointManager(
             save_dir=os.path.join(self.output_dir, "checkpoints"), **cfg.checkpoint.topk
@@ -357,13 +376,13 @@ class TrainUnifiedVideoActionWorkspace(BaseWorkspace):
                 step_log.update(act_log)
 
             # ========= simulator: run rollout =========
-            if (
-                cfg.model.policy.action_model_params.predict_action
-                and "env_runner" in cfg.task
-            ):
+            if rollout_enabled:
                 if (self.epoch % cfg.training.rollout_every) == 0:
-                    runner_log = env_rollout(cfg, env_runners, policy)
-                    step_log.update(runner_log)
+                    accelerator.wait_for_everyone()
+                    if accelerator.is_main_process:
+                        runner_log = env_rollout(cfg, env_runners, policy)
+                        step_log.update(runner_log)
+                    accelerator.wait_for_everyone()
 
             # ========= checkpoint =========
             if (
