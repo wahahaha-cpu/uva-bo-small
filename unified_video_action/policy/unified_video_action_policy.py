@@ -28,6 +28,7 @@ from unified_video_action.utils.language_model import (
     get_text_model,
     extract_text_features,
 )
+from unified_video_action.model.common.jepa_teacher import JEPATeacher
 from unified_video_action.model.common.student_tokenizer import StudentLatentTokenizer
 
 
@@ -64,6 +65,8 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
         self.use_student_tokenizer = bool(kwargs.get("use_student_tokenizer", False))
         self.student_tokenizer_params = kwargs.get("student_tokenizer_params", None)
         self.align_params = kwargs.get("align_params", {})
+        self.teacher_type = str(kwargs.get("teacher_type", "vae")).lower()
+        self.jepa_teacher_params = kwargs.get("jepa_teacher_params", {})
 
         # Alignment defaults are intentionally conservative for stable joint training.
         self.use_alignment = bool(self.align_params.get("enable", False))
@@ -76,7 +79,24 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
         self.align_projector_dim = int(self.align_params.get("projector_dim", 512))
         self.align_mse_coeff = float(self.align_params.get("mse_coeff", 0.25))
         self.align_stats_coeff = float(self.align_params.get("stats_coeff", 0.1))
+        default_align_on = "latent" if self.teacher_type == "jepa" else "token_feat"
+        self.align_on = str(
+            self.align_params.get("align_on", default_align_on)
+        ).lower()
         self._last_align_metrics = {}
+
+        if self.teacher_type not in ("vae", "jepa"):
+            raise ValueError(
+                f"Unsupported teacher_type={self.teacher_type!r}. "
+                "Expected 'vae' or 'jepa'."
+            )
+        if self.teacher_type == "jepa":
+            if not self.use_student_tokenizer:
+                raise ValueError(
+                    "teacher_type='jepa' requires use_student_tokenizer=True."
+                )
+            if self.align_on != "latent":
+                raise ValueError("JEPA alignment requires align_on='latent'.")
 
         ## =========================== load vae model ===========================
         with torch.no_grad():
@@ -84,6 +104,12 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
         self.vae_model.eval()
         for param in self.vae_model.parameters():
             param.requires_grad = False
+
+        # =========================== JEPA teacher ===========================
+        self.jepa_teacher = None
+        self.teacher_latent_projector = None
+        if self.teacher_type == "jepa":
+            self.jepa_teacher = JEPATeacher(**self.jepa_teacher_params)
 
         # =========================== student tokenizer ===========================
         self.student_tokenizer = None
@@ -94,6 +120,20 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
                     "use_student_tokenizer=True but student_tokenizer_params is not provided."
                 )
             self.student_tokenizer = StudentLatentTokenizer(**self.student_tokenizer_params)
+            if self.use_alignment and self.teacher_type == "jepa":
+                latent_dim = int(
+                    self.student_tokenizer_params.get(
+                        "latent_channels", autoregressive_model_params.vae_embed_dim
+                    )
+                )
+                self.align_use_projector = False
+                self.teacher_latent_projector = torch.nn.Sequential(
+                    torch.nn.Linear(self.jepa_teacher.feat_dim, self.align_projector_dim),
+                    torch.nn.SiLU(),
+                    torch.nn.Linear(self.align_projector_dim, self.align_projector_dim),
+                    torch.nn.SiLU(),
+                    torch.nn.Linear(self.align_projector_dim, latent_dim),
+                )
             if self.use_alignment and self.align_use_projector:
                 hidden_dim = int(self.student_tokenizer_params.get("hidden_dim", 384))
                 latent_dim = int(
@@ -405,6 +445,12 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
             optim_groups.extend(
                 self.add_weight_decay(self.align_projector, weight_decay=weight_decay)
             )
+        if self.teacher_latent_projector is not None:
+            optim_groups.extend(
+                self.add_weight_decay(
+                    self.teacher_latent_projector, weight_decay=weight_decay
+                )
+            )
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas)
 
         # Manually set 'initial_lr' for each parameter group (assuming a base learning rate)
@@ -441,6 +487,51 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
         # z [B, T, C, H, W] -> [B, T, S, C]
         bsz, timesteps, channels, height, width = z.shape
         return z.permute(0, 1, 3, 4, 2).reshape(bsz, timesteps, height * width, channels)
+
+    @staticmethod
+    def _resample_teacher_tokens(
+        student_tokens: torch.Tensor, teacher_tokens: torch.Tensor
+    ) -> torch.Tensor:
+        if student_tokens.shape[1:3] == teacher_tokens.shape[1:3]:
+            return teacher_tokens
+
+        bsz, timesteps, student_token_count, _ = student_tokens.shape
+        if bsz != teacher_tokens.shape[0] or timesteps != teacher_tokens.shape[1]:
+            raise ValueError(
+                "JEPA/student batch or time mismatch: "
+                f"student={student_tokens.shape}, teacher={teacher_tokens.shape}"
+            )
+
+        teacher_token_count = teacher_tokens.shape[2]
+        feat_dim = teacher_tokens.shape[3]
+        student_side = int(student_token_count**0.5)
+        teacher_side = int(teacher_token_count**0.5)
+        if student_side * student_side != student_token_count:
+            raise ValueError(
+                f"Student token count {student_token_count} is not a square grid."
+            )
+        if teacher_side * teacher_side != teacher_token_count:
+            raise ValueError(
+                f"JEPA token count {teacher_token_count} is not a square grid."
+            )
+
+        teacher_map = teacher_tokens.reshape(
+            bsz, timesteps, teacher_side, teacher_side, feat_dim
+        )
+        teacher_map = teacher_map.permute(0, 1, 4, 2, 3).reshape(
+            bsz * timesteps, feat_dim, teacher_side, teacher_side
+        )
+        teacher_map = F.interpolate(
+            teacher_map,
+            size=(student_side, student_side),
+            mode="bilinear",
+            align_corners=False,
+        )
+        return teacher_map.reshape(
+            bsz, timesteps, feat_dim, student_side, student_side
+        ).permute(0, 1, 3, 4, 2).reshape(
+            bsz, timesteps, student_token_count, feat_dim
+        )
 
     def _encode_student_latent(self, x: torch.Tensor):
         latent, token_feat = self.student_tokenizer(x)
@@ -553,10 +644,26 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
                     proprioception_input["pred_second_image_z"] = pred_second_image_z
 
             if self.use_alignment:
-                teacher_z = self._extract_teacher_latent(x_img)
-                teacher_c = self._extract_teacher_latent(c_img)
-                teacher_z_tokens = self._latent_to_tokens(teacher_z)
-                teacher_c_tokens = self._latent_to_tokens(teacher_c)
+                if self.teacher_type == "jepa":
+                    z_feat = self._latent_to_tokens(z)
+                    c_feat = self._latent_to_tokens(c)
+                    teacher_z_tokens = self.teacher_latent_projector(
+                        self.jepa_teacher.extract_tokens(x_img)
+                    )
+                    teacher_c_tokens = self.teacher_latent_projector(
+                        self.jepa_teacher.extract_tokens(c_img)
+                    )
+                    teacher_z_tokens = self._resample_teacher_tokens(
+                        z_feat, teacher_z_tokens
+                    )
+                    teacher_c_tokens = self._resample_teacher_tokens(
+                        c_feat, teacher_c_tokens
+                    )
+                else:
+                    teacher_z = self._extract_teacher_latent(x_img)
+                    teacher_c = self._extract_teacher_latent(c_img)
+                    teacher_z_tokens = self._latent_to_tokens(teacher_z)
+                    teacher_c_tokens = self._latent_to_tokens(teacher_c)
                 align_z, metrics_z = self._compute_alignment_loss(z_feat, teacher_z_tokens)
                 align_c, metrics_c = self._compute_alignment_loss(c_feat, teacher_c_tokens)
                 align_loss = 0.5 * (align_z + align_c)
@@ -609,6 +716,11 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
 
         if self.align_projector is not None:
             for param in self.align_projector.parameters():
+                if param.requires_grad:
+                    loss = loss + _ddp_unused_term(param)
+
+        if self.teacher_latent_projector is not None:
+            for param in self.teacher_latent_projector.parameters():
                 if param.requires_grad:
                     loss = loss + _ddp_unused_term(param)
 

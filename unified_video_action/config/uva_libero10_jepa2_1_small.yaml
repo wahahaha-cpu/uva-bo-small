@@ -1,0 +1,29 @@
+# Libero10 small policy with V-JEPA 2.1 latent alignment.
+name: uva_libero10_jepa2_1_small
+
+defaults:
+  - uva_libero10_student
+  - override /model/student_tokenizer: small
+  - _self_
+
+model:
+  policy:
+    teacher_type: jepa
+    jepa_teacher_params:
+      model_name: vjepa2_1_vit_base_384
+      img_size: 384
+      tubelet_size: 2
+      checkpoint_path: pretrained_models/jepa/vjepa2_1_vitb_dist_vitG_384.pt
+      checkpoint_key: ema_encoder
+      loader: checkpoint
+    align_params:
+      align_on: latent
+      use_projector: false
+
+logging:
+  project: uva-repa-jepa
+  name: train_uva_libero10_jepa2_1_small
+  tags:
+    - train_uva_libero10_jepa2_1_small
+    - libero10
+    - jepa2_1_teacher
