@@ -1,0 +1,20 @@
+# Libero10 small policy with V-JEPA 2.1 token-feature alignment.
+name: uva_libero10_jepa2_1_small_token_feat
+
+defaults:
+  - uva_libero10_jepa2_1_small
+  - _self_
+
+model:
+  policy:
+    align_params:
+      align_on: token_feat
+      use_projector: true
+
+logging:
+  name: train_uva_libero10_jepa2_1_small_token_feat
+  tags:
+    - train_uva_libero10_jepa2_1_small_token_feat
+    - libero10
+    - jepa2_1_teacher
+    - token_feat_alignment

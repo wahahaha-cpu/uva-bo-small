@@ -1,6 +1,21 @@
-# V-JEPA 2.1 latent 对齐移植说明
+# V-JEPA 2.1 对齐版本变更记录
 
-## 1. 任务范围
+> 本文档是 JEPA 对齐相关改动的统一记录。后续版本的设计、实现文件、验证结果和启动方式都追加在这里；不把训练产物、checkpoint 或无关脚本计入版本改动。
+
+## 0. 版本总览
+
+| 版本 | Git 分支 | 提交 | 对齐方式 | 状态 |
+|---|---|---|---|---|
+| V1 | `jepa2_1_latent_alignment` | `4ce6c11` | teacher JEPA token 投影到 16 维，与 student 最终 latent `z` 对齐 | 已完成 |
+| V2 | `jepa2_1_token_feat_alignment` | 本分支 HEAD | student 最终 encoder `token_feat` 通过现有 `align_projector` 投影到 768 维，单方面对齐原始 JEPA token | 已完成 |
+
+### 0.1 版本保存约定
+
+1. 每种对齐方案使用独立 Git 分支和独立 commit，保留上一版可复现状态。
+2. 每次只提交代码、配置、启动脚本和本文档；不提交 `checkpoints`、数据集、缓存或无关脚本。
+3. V2 是在 V1 基础上新增模式，不修改或删除 V1 的 `align_on: latent` 行为。
+
+## 1. V1 初始移植任务范围
 
 - 参考仓库：`/home/jinboning/project/uva-bo`
 - 修改目标：`/home/jinboning/project/uva-bo-small`
@@ -115,11 +130,13 @@ x: [B, 3, T, 256, 256]
 
 处理顺序：
 
-1. 每帧从 `256 × 256` 双线性缩放到 `384 × 384`。
-2. 使用 ImageNet mean/std 归一化。
-3. 把每一帧复制成长度为 2 的短视频，匹配 JEPA 的 `tubelet_size=2`。
-4. 将 `B × T` 个短视频一起送入 JEPA encoder。
-5. 输出恢复为 `[B, T, 576, 768]`。
+1. policy 的 `process_data()` 已把原始 `[0, 1]` RGB 图像转换为 `[-1, 1]`，供 student/MAR 使用。
+2. JEPA teacher 先将其恢复为 `(x + 1) * 0.5`，得到官方预处理要求的 `[0, 1]` RGB 值。
+3. 每帧从 `256 × 256` 双线性缩放到 `384 × 384`。
+4. 使用官方 V-JEPA 2.1 的 ImageNet mean/std：`(0.485, 0.456, 0.406)` / `(0.229, 0.224, 0.225)`。
+5. 把每一帧复制成长度为 2 的短视频，匹配 JEPA 的 `tubelet_size=2`。
+6. 将 `B × T` 个短视频一起送入 JEPA encoder。
+7. 输出恢复为 `[B, T, 576, 768]`。
 
 对应形状：
 
@@ -147,17 +164,17 @@ self.jepa_teacher_params = kwargs.get("jepa_teacher_params", {})
 
 `teacher_type` 默认仍为 `vae`，所以所有旧配置在不指定 JEPA 时继续走原逻辑。
 
-新增约束：
+V1 初始版本的约束：
 
 - `teacher_type` 只允许 `vae` 或 `jepa`
 - JEPA 必须启用 student tokenizer
-- JEPA 必须使用 `align_on=latent`
+- V1 只允许 JEPA 使用 `align_on=latent`
 
-这些约束用于尽早发现配置错误，防止看似启动成功、实际却没有对齐最终 latent。
+这些约束用于尽早发现配置错误，防止看似启动成功、实际却没有对齐最终 latent。V2 在保留该分支的同时新增 `align_on=token_feat`，见第 14 节。
 
 ### 5.2 对齐对象
 
-原 VAE 对齐使用 student 的中间 token feature：
+原 VAE 对齐使用 student 最终 encoder 输出的 token feature：
 
 ```text
 token_feat: [B, T, 256, 304]
@@ -403,12 +420,12 @@ student latent_channels: 16
 
 对上述四个动作核心文件执行 `git diff --quiet` 的返回值为 0。
 
-## 9. 没有移植的 uva-bo 内容
+## 9. V1 没有移植的 uva-bo 内容
 
 为满足最小改动要求，以下内容没有带入：
 
 - DINOv2 teacher
-- JEPA token-feature 对齐
+- JEPA token-feature 对齐（V1 未包含；V2 后续作为独立本地增量实现）
 - VAE latent-policy 实验配置
 - 旧版 V-JEPA 模型
 - JEPA2.1 Large/Giant/Gigantic
@@ -591,3 +608,171 @@ logging.project=uva-repa-new
 ```
 
 本次没有修改这两个项目；实现代码统计也没有把它们算入本次改动。
+
+## 14. V2：仿照 VAE 的 JEPA token-feature 单侧对齐
+
+### 14.1 最终需求与对齐职责
+
+V2 的核心要求是仿照仓库原有 VAE 对齐方式：teacher 保持冻结且不经过可训练 projector，只让 student 通过现有 `align_projector` 学习贴近 teacher。
+
+三条路径的区别如下：
+
+| 路径 | student 对齐输入 | student projector | teacher 对齐目标 | teacher projector |
+|---|---|---|---|---|
+| 原 VAE | 最终 encoder `token_feat [B,T,256,304]` | `304 -> 512 -> 512 -> 16` | VAE latent `[B,T,256,16]` | 无 |
+| V1 JEPA latent | latent `z/c [B,T,256,16]` | 无 | JEPA token 投影后的 `[B,T,256,16]` | `768 -> 512 -> 512 -> 16` |
+| V2 JEPA token feature | 最终 encoder `token_feat [B,T,256,304]` | `304 -> 512 -> 512 -> 768` | 原始 JEPA token `[B,T,256,768]` | 无 |
+
+这里的 `token_feat` 不是浅层或中间层特征。它在 tokenizer 中经过了全部编码层：
+
+```text
+stem -> patch_embed -> all Transformer blocks -> LayerNorm
+     -> optional temporal mixer residual -> token_feat
+     -> out_proj(304 -> 16) -> latent
+```
+
+`token_feat` 是最终 encoder 表征；称它位于 `out_proj` 前，只是在区分 304 维 encoder 输出和 16 维 latent head 输出。
+
+因此 V2 明确满足：
+
+- 只投影 student，不投影 JEPA teacher。
+- 直接复用已有 `align_projector` 属性、优化器参数组、DDP 图连接和 `_compute_alignment_loss()`。
+- 不新增 `teacher_token_projector`。
+- V2 中 `teacher_latent_projector is None`。
+- V1 中 `align_projector is None`，原 `teacher_latent_projector` 及其 16 维输出保持不变。
+
+### 14.2 V2 完整数据流
+
+condition 和 target 两侧仍分别对齐。以 target `x_img` 为例：
+
+```text
+x_img
+  -> StudentLatentTokenizer
+  -> z_token_feat [B,T,256,304]
+  -> align_projector
+       Linear(304,512) -> SiLU
+       Linear(512,512) -> SiLU
+       Linear(512,768)
+  -> student_z_aligned [B,T,256,768]
+
+x_img
+  -> frozen V-JEPA2.1 Base
+  -> raw teacher_z_tokens [B,T,576,768]
+  -> reshape [B*T,768,24,24]
+  -> bilinear interpolate to 16x16
+  -> teacher_z_tokens [B,T,256,768]
+
+student_z_aligned <-> teacher_z_tokens
+  -> existing cosine/MSE/statistics alignment loss
+```
+
+condition `c_img` 同样产生 `c_token_feat` 和原始 `teacher_c_tokens`，最终：
+
+```text
+align_loss = 0.5 * (align_z + align_c)
+final_loss = original_loss + align_coeff * align_loss
+```
+
+空间 `24x24 -> 16x16` 插值只匹配 token 网格，不改变特征维度，也不是可训练 projector。JEPA encoder 的 `extract_tokens()` 仍在 `torch.no_grad()` 下执行，teacher 参数保持冻结。
+
+student tokenizer 产生的最终 `z` 和 `c` 仍原样传入 MAR/action policy；V2 使用最终 encoder `token_feat`（`out_proj` 前）计算辅助 loss，没有改变动作生成、rollout 或推理路径。
+
+### 14.3 policy 实现
+
+修改文件：`unified_video_action/policy/unified_video_action_policy.py`
+
+具体修改：
+
+1. JEPA 的 `align_on` 合法值从仅 `latent` 扩展为 `latent` 或 `token_feat`。
+2. 当 `align_on=latent` 时，保持 V1：创建 `teacher_latent_projector(768 -> 16)`，关闭 student `align_projector`。
+3. 当 `align_on=token_feat` 时，保持 teacher 原始 768 维 token，不创建 `teacher_latent_projector`，启用已有 student `align_projector`。
+4. `align_projector` 对原 VAE teacher 仍输出 16 维；仅当 teacher 是 JEPA 且对齐 token feature 时输出 `self.jepa_teacher.feat_dim=768`。
+5. compute loss 中把局部变量改为 `z_token_feat`、`c_token_feat`、`student_z_tokens`、`student_c_tokens`，避免再把最终 encoder token feature 和 latent head 输出混用。
+6. teacher token 的空间重采样继续复用 `_resample_teacher_tokens()`。
+7. loss、metrics、optimizer 和 DDP safety 继续复用现有代码，没有新增第二套逻辑。
+
+本版 policy 相对 V1 为 51 行新增、29 行删除；删除主要来自把单一路径改成显式的 `latent/token_feat` 分支，并非删除 V1 功能。
+
+### 14.4 V2 配置
+
+新增文件：`unified_video_action/config/uva_libero10_jepa2_1_small_token_feat.yaml`（20 行）。
+
+它继承 V1 配置：
+
+```yaml
+defaults:
+  - uva_libero10_jepa2_1_small
+  - _self_
+```
+
+只覆盖实验名和以下对齐开关：
+
+```yaml
+model:
+  policy:
+    align_params:
+      align_on: token_feat
+      use_projector: true
+```
+
+因此 JEPA checkpoint、ImageNet 预处理、small student、alignment loss 系数、动作模型和数据设置均继承 V1，不复制配置。
+
+### 14.5 V2 训练脚本
+
+新增可执行文件：`scripts/training/train_uva_libero10_jepa2_1_small_token_feat.sh`（76 行）。
+
+默认参数：
+
+```text
+GPU_IDS=4,5,6,7
+NUM_PROCESSES=4
+PER_DEVICE_BATCH=8
+GRAD_ACCUM_STEPS=4
+EXPECTED_GLOBAL_BATCH=128
+LR_WARMUP_STEPS=2000
+training.resume=False
+```
+
+脚本固定使用：
+
+```text
+--config-name=uva_libero10_jepa2_1_small_token_feat.yaml
+```
+
+默认运行目录带 `uva_libero10_jepa2_1_small_token_feat_<timestamp>`，不会与 V1 或其他实验复用 checkpoint。脚本保留 V1 的 GPU 数量、global batch、依赖路径和 Accelerate 检查。
+
+启动命令：
+
+```bash
+./scripts/training/train_uva_libero10_jepa2_1_small_token_feat.sh
+```
+
+### 14.6 V2 验证结果
+
+已完成并通过：
+
+1. policy 使用项目 Conda Python 执行 `py_compile`。
+2. 新脚本执行 `bash -n`。
+3. Hydra 完整合成 V2 配置，确认 `teacher_type=jepa`、`align_on=token_feat`、`use_projector=true`、`hidden_dim=304`、`latent_channels=16`。
+4. 使用 `ACCELERATE_BIN=/bin/echo` 做无训练 dry-run，确认 4 进程、单卡 batch 8、累积 4、global batch 128、warmup 2000、resume false 和独立 run directory。
+5. `git diff --check` 通过。
+6. 轻量 policy 构造断言通过：
+   - V2：`align_projector` 输入 304、输出 768，`teacher_latent_projector=None`。
+   - V1：`align_projector=None`，`teacher_latent_projector` 输出 16。
+   - 原 VAE：`align_projector` 输入 304、输出 16，teacher projector 不存在。
+7. V2 形状检查通过：teacher `[1,2,576,768] -> [1,2,256,768]`，student `[1,2,256,304] -> [1,2,256,768]`。
+8. V2、V1 和原 VAE 三条路径的 alignment loss 反向传播均通过；梯度落到各自应训练的 student/projector 参数。
+
+尚未执行完整多 GPU 长时间训练或 rollout；当前验证覆盖语法、配置、启动展开、三种模块结构、关键维度和 loss 反向闭环。
+
+### 14.7 V2 改动边界
+
+V2 没有修改：
+
+- JEPA teacher 实现与图像预处理。
+- student tokenizer 网络结构。
+- MAR、action diffusion、trajectory、rollout、eval 或 dataset。
+- V1 配置和 V1 启动脚本。
+- 用户原有未跟踪的 `checkpoints` 与 `scripts/training/train_uva_libero10_small_aligned.sh`。
+
+V2 只在分支 `jepa2_1_token_feat_alignment` 本地保存；在用户明确要求前不推送远端。
