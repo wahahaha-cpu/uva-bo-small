@@ -291,9 +291,10 @@ x = self.proj_cond_x_layer(x)
 实验 B：严格冻结整个 pretrained MAR
     只有 student + align projector 可训练
     position/fake token 保留 checkpoint 数值但 requires_grad=False
+    这就是新增 V4
 ```
 
-实验 A 更容易适应新 student latent 分布；实验 B 更严格地把 action loss 的调整压力放到 student。当前 fake/position 参数容量较小且对所有样本共享，不能单独记住每个样本的动作，但确实可以吸收一部分全局偏置。因此若研究问题是“动作误差是否只能推动 student”，实验 B 是更干净的对照组。
+实验 A 更容易适应新 student latent 分布；实验 B 更严格地把 action loss 的调整压力放到 student。当前 fake/position 参数容量较小且对所有样本共享，不能单独记住每个样本的动作，但确实可以吸收一部分全局偏置。因此若研究问题是“动作误差是否只能推动 student”，实验 B 是更干净的对照组。当前决定采用实验 B，同时保留 V3 作为实验 A 的可复现版本。
 
 ### 3.5 为什么还保存参数名称
 

@@ -72,17 +72,21 @@ class TinyMar(nn.Module):
         return self.action_head(hidden)
 
 
-def configure_mar_trainability(mar: nn.Module) -> tuple[str, ...]:
-    """Freeze all MAR parameters, then reopen the whitelist."""
+def configure_mar_trainability(
+    mar: nn.Module,
+    keep_pos_and_fake_trainable: bool,
+) -> tuple[str, ...]:
+    """Freeze all MAR parameters and optionally reopen the interface whitelist."""
     mar.requires_grad_(False)
-    for name, param in mar.named_parameters():
-        if is_mar_pos_or_fake_parameter(name):
-            param.requires_grad = True
+    if keep_pos_and_fake_trainable:
+        for name, param in mar.named_parameters():
+            if is_mar_pos_or_fake_parameter(name):
+                param.requires_grad = True
 
     trainable_names = tuple(
         name for name, param in mar.named_parameters() if param.requires_grad
     )
-    if not trainable_names:
+    if keep_pos_and_fake_trainable and not trainable_names:
         raise RuntimeError("The MAR whitelist matched no parameters.")
     return trainable_names
 
@@ -204,7 +208,10 @@ def main() -> None:
     student = TinyStudent()
     mar = TinyMar()
     align_projector = nn.Linear(4, 4)
-    trainable_mar_names = configure_mar_trainability(mar)
+    trainable_mar_names = configure_mar_trainability(
+        mar,
+        keep_pos_and_fake_trainable=True,
+    )
 
     optimizer_groups: list[dict[str, object]] = []
     for module in (mar, student, align_projector):
@@ -292,7 +299,56 @@ def main() -> None:
         "DDP zero-term demonstration: PASS "
         "(grad exists for unused parameters, but norm is zero)"
     )
-    print("PASS: whitelist optimizer and frozen-MAR gradient flow are correct.")
+    print("PASS: whitelist optimizer and selective frozen-MAR flow are correct.")
+
+    # Strict V4 mode: every MAR parameter, including fake/position parameters,
+    # is frozen and excluded from AdamW. The ordinary MAR forward must still
+    # propagate the action loss to the student condition representation.
+    strict_student = TinyStudent()
+    strict_mar = TinyMar()
+    strict_align_projector = nn.Linear(4, 4)
+    strict_trainable_mar_names = configure_mar_trainability(
+        strict_mar,
+        keep_pos_and_fake_trainable=False,
+    )
+    assert strict_trainable_mar_names == ()
+    assert not any(param.requires_grad for param in strict_mar.parameters())
+
+    strict_optimizer_groups: list[dict[str, object]] = []
+    for module in (strict_mar, strict_student, strict_align_projector):
+        strict_optimizer_groups.extend(add_weight_decay(module, weight_decay=0.01))
+    strict_optimizer = torch.optim.AdamW(strict_optimizer_groups, lr=1e-2)
+    assert_optimizer_membership(
+        strict_mar,
+        strict_student,
+        strict_align_projector,
+        strict_optimizer,
+    )
+
+    strict_mar_before = clone_parameters(strict_mar)
+    strict_optimizer.zero_grad(set_to_none=True)
+    strict_action_loss = make_action_loss(
+        strict_student,
+        strict_mar,
+        observation,
+        action_target,
+    )
+    strict_action_loss.backward()
+
+    strict_student_grad = module_grad_norm(strict_student)
+    assert strict_student_grad > 0.0, (
+        "Action loss did not cross the fully frozen MAR to reach the student."
+    )
+    assert all(param.grad is None for param in strict_mar.parameters())
+    assert module_grad_norm(strict_align_projector) == 0.0
+
+    strict_optimizer.step()
+    assert not changed_parameter_names(strict_mar, strict_mar_before)
+
+    print("Fully frozen MAR trainable parameter count: 0")
+    print(f"Fully frozen MAR student grad norm: {strict_student_grad:.6e}")
+    print("Fully frozen MAR optimizer/gradient/update checks: PASS")
+    print("PASS: selective and fully frozen MAR modes are both correct.")
 
 
 if __name__ == "__main__":
