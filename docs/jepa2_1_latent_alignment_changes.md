@@ -8,12 +8,14 @@
 |---|---|---|---|---|
 | V1 | `jepa2_1_latent_alignment` | `4ce6c11` | teacher JEPA token 投影到 16 维，与 student 最终 latent `z` 对齐 | 已完成 |
 | V2 | `jepa2_1_token_feat_alignment` | 本分支 HEAD | student 最终 encoder `token_feat` 通过现有 `align_projector` 投影到 768 维，单方面对齐原始 JEPA token | 已完成 |
+| V3 | `jepa2_1_token_feat_frozen_mar` | 本分支 HEAD | 保持 V2 token-feature 对齐，冻结 MAR blocks/heads，只训练 position embedding 与 fake/blank token 接口参数 | 已完成 |
 
 ### 0.1 版本保存约定
 
 1. 每种对齐方案使用独立 Git 分支和独立 commit，保留上一版可复现状态。
 2. 每次只提交代码、配置、启动脚本和本文档；不提交 `checkpoints`、数据集、缓存或无关脚本。
 3. V2 是在 V1 基础上新增模式，不修改或删除 V1 的 `align_on: latent` 行为。
+4. V3 在 V2 基础上只改变 MAR 参数的可训练范围，不改变 JEPA 对齐、loss、数据或推理结构。
 
 ## 1. V1 初始移植任务范围
 
@@ -776,3 +778,394 @@ V2 没有修改：
 - 用户原有未跟踪的 `checkpoints` 与 `scripts/training/train_uva_libero10_small_aligned.sh`。
 
 V2 只在分支 `jepa2_1_token_feat_alignment` 本地保存；在用户明确要求前不推送远端。
+
+## 15. V3：JEPA token-feature 对齐与选择性冻结 MAR
+
+### 15.1 实验目的
+
+V3 用于检验：当下游 MAR 主体和动作头不再更新时，action loss 与 JEPA token-feature alignment 是否能更集中地优化 student tokenizer。
+
+V3 完整继承 V2：
+
+- student 使用最终 encoder `token_feat [B,T,256,304]`。
+- 现有 student `align_projector` 执行 `304 -> 512 -> 512 -> 768`。
+- frozen JEPA teacher 保持原始 768 维 token，只做 `24x24 -> 16x16` 空间插值。
+- condition 与 target 两侧的 alignment loss、系数和 metrics 不变。
+- MAR/action 的前向结构、loss 计算、masking、dropout、EMA、rollout 和推理逻辑不变。
+
+V3 唯一改变的是参数的 `requires_grad` 范围。
+
+### 15.2 为什么不是整个 MAR 一刀切冻结
+
+用户要求冻结 MAR encoder、decoder、动作头等重型结构，但保留 position embedding 和可学习的 fake/blank token。原因是这些参数承担输入位置、mask、空白 target/action 和 classifier-free guidance 的接口语义，可以少量适配新的 student 表征。
+
+这意味着 V3 不是“只有 student 可学习”，而是：
+
+```text
+可学习：student tokenizer
+       + student align_projector
+       + MAR position embeddings
+       + MAR fake/blank tokens
+
+冻结：MAR 输入/条件线性投影
+     + encoder blocks/norm
+     + decoder embed/blocks/norm
+     + video diffusion head
+     + action diffusion/head
+     + 其他 MAR 参数
+```
+
+位置向量和 fake token 不会清零或重新初始化。policy 先加载 `checkpoints/libero10_video.ckpt`，然后冻结参数并重新打开白名单，因此这些参数从 pretrained MAR 的值继续训练。
+
+### 15.3 MAR 可学习参数白名单
+
+新增判断 `_is_mar_pos_or_fake_parameter()`，当前规则允许：
+
+- 参数叶子名以 `fake_` 开头。
+- 参数叶子名以 `_pos_embed` 结尾。
+- `diffusion_temporal_embed` 与 `diffusion_spatial_embed`。
+- 为未来兼容预留的 `mask_token` 与 `blank_token`。
+
+按当前 Libero10 配置（CLIP language、无 wrist/history/proprio 分支），真实 MAR 白名单是：
+
+```text
+fake_latent_x
+fake_action_latent
+fake_latent
+temporal_pos_embed
+spatial_pos_embed
+text_pos_embed
+decoder_temporal_pos_embed
+decoder_spatial_pos_embed
+decoder_text_pos_embed
+diffusion_temporal_embed
+diffusion_spatial_embed
+```
+
+以下容易混淆的模块仍然冻结：
+
+```text
+z_proj / z_proj_cond / action_proj_cond
+text_proj_cond / proj_cond_x_layer / z_proj_ln
+encoder_blocks / encoder_norm
+decoder_embed / decoder_blocks / decoder_norm
+diffloss / diffactloss
+```
+
+特意冻结这些线性适配层和 head，是为了避免 action loss 主要被下游大模块吸收，削弱对 student tokenizer 的训练压力。
+
+### 15.4 action loss 的真实梯度路径
+
+实现只修改 MAR 参数的 `requires_grad`，没有对 MAR 前向使用 `torch.no_grad()`，也没有 detach student 的 `z/c`。因此冻结的线性层、encoder、decoder 和 action head 仍对输入可微。
+
+当前配置固定：
+
+```text
+selected_training_mode: policy_model
+```
+
+在 `policy_model` 分支中，MAR 的实际 action 梯度路径是：
+
+```text
+c_img
+  -> student tokenizer
+  -> condition latent c
+  -> frozen z_proj_cond
+  -> trainable position/fake interface params
+  -> frozen encoder
+  -> frozen decoder
+  -> frozen action diffusion/head
+  -> action loss
+  -> gradient 返回 c 和共享的 student tokenizer 参数
+```
+
+需要特别注意：`policy_model` 中 target `x/z` 在 encoder 输入处由 `fake_latent_x` 替代，video loss 为 0，因此 action loss 不直接依赖 target latent `z`。target `z` 仍通过 JEPA alignment loss 获得监督；condition `c` 同时获得 action loss 和 JEPA alignment loss。
+
+冻结 MAR 不会改变上述依赖关系，只会阻止 frozen MAR 参数更新。
+
+### 15.5 policy 开关与兼容性
+
+修改文件：`unified_video_action/policy/unified_video_action_policy.py`。
+
+新增两个默认关闭的配置项：
+
+```yaml
+freeze_mar: false
+keep_mar_pos_and_fake_trainable: false
+```
+
+V3 覆盖为：
+
+```yaml
+freeze_mar: true
+keep_mar_pos_and_fake_trainable: true
+```
+
+执行顺序：
+
+1. 构建 MAR。
+2. 加载 pretrained MAR checkpoint。
+3. `self.model.requires_grad_(False)` 冻结所有 MAR 参数。
+4. 按白名单重新设置 position/fake 参数的 `requires_grad=True`。
+5. 保存 `mar_trainable_parameter_names` 供检查。
+6. 若要求保留白名单但没有匹配到任何参数，立即报错，防止未来参数重命名后静默全冻结。
+
+默认值均为 false，所以 V1、V2、原 VAE 和所有旧配置的 MAR 可训练行为不变。
+
+### 15.6 优化器、DDP 与 EMA
+
+现有 `add_weight_decay()` 已跳过 `requires_grad=False` 参数，因此：
+
+- frozen encoder/decoder/action head 不进入 AdamW。
+- student tokenizer、`align_projector` 和 MAR 白名单参数进入 AdamW。
+- 原 DDP safety term 只连接仍可训练的 MAR 白名单参数。
+- frozen MAR 参数在 EMA step 中直接复制当前值；白名单、student 和 projector 继续做 EMA。
+
+没有修改 workspace、optimizer 类、scheduler 或 EMA 实现。
+
+### 15.7 V3 配置和脚本
+
+新增配置：`unified_video_action/config/uva_libero10_jepa2_1_small_token_feat_frozen_mar.yaml`（23 行）。
+
+它继承：
+
+```yaml
+defaults:
+  - uva_libero10_jepa2_1_small_token_feat
+  - _self_
+```
+
+新增脚本：`scripts/training/train_uva_libero10_jepa2_1_small_token_feat_frozen_mar.sh`（76 行，可执行）。
+
+默认启动参数：
+
+```text
+GPU_IDS=0,1,2,3
+NUM_PROCESSES=4
+PER_DEVICE_BATCH=8
+GRAD_ACCUM_STEPS=4
+GLOBAL_BATCH=128
+LR_WARMUP_STEPS=2000
+training.resume=False
+```
+
+启动：
+
+```bash
+./scripts/training/train_uva_libero10_jepa2_1_small_token_feat_frozen_mar.sh
+```
+
+默认运行目录为 `checkpoints/uva_libero10_jepa2_1_small_token_feat_frozen_mar_<timestamp>`。
+
+### 15.8 验证结果
+
+已完成：
+
+1. policy `py_compile` 通过。
+2. V3 脚本 `bash -n` 通过。
+3. Hydra 同时合成 V2/V3，确认 V2 默认 `freeze_mar=false`，V3 为 `freeze_mar=true`、`keep_mar_pos_and_fake_trainable=true`。
+4. V3 继续是 `teacher_type=jepa`、`align_on=token_feat`、student hidden dim 304。
+5. 脚本 dry-run 确认 GPU 0-3、4 进程、batch 8、累积 4、global batch 128、warmup 2000、resume false 和独立目录。
+6. 轻量 MAR 白名单测试确认仅 position/fake/mask/blank 参数可训练。
+7. 优化器测试确认 frozen encoder/decoder/action head 参数不在 AdamW 中，student、projector 和白名单参数在 AdamW 中。
+8. 反向测试确认 action-like loss 能穿过 frozen MAR 到达 student；frozen 参数无梯度，白名单参数有梯度。
+9. 旧 V2 mock policy 的全部 MAR 参数仍为可训练，兼容性检查通过。
+10. `git diff --check` 通过。
+
+尚未运行真实多 GPU 长时间训练或 rollout。
+
+### 15.9 文件与改动边界
+
+V3 源码改动（不含本文档）：
+
+| 文件 | 类型 | 新增 | 删除 |
+|---|---|---:|---:|
+| `unified_video_action/policy/unified_video_action_policy.py` | 修改 | 47 | 0 |
+| `unified_video_action/config/uva_libero10_jepa2_1_small_token_feat_frozen_mar.yaml` | 新增 | 23 | 0 |
+| `scripts/training/train_uva_libero10_jepa2_1_small_token_feat_frozen_mar.sh` | 新增 | 76 | 0 |
+| 合计 | 3 个文件 | 146 | 0 |
+
+V3 没有修改 MAR 源文件、student tokenizer、JEPA teacher、dataset、workspace、action loss、rollout 或推理实现。
+
+当前工作区中用户已有的 V2 配置 `logging.project` 和 V2 脚本 GPU 0-3 改动保持未暂存；`checkpoints` 与旧 aligned 脚本同样不纳入 V3 提交。
+
+V3 位于本地分支 `jepa2_1_token_feat_frozen_mar`；用户明确要求前不推送远端。
+
+### 15.10 逐处代码修改审核清单
+
+本节以 V2 commit `323ba5c` 为基线，记录 V3 的全部代码修改。以下行号对应当前 V3 源文件；最终提交后以 `git diff 323ba5c..HEAD` 为权威差异。
+
+#### 15.10.1 文件总览
+
+| 文件 | 修改位置 | 内容 |
+|---|---|---|
+| `unified_video_action/policy/unified_video_action_policy.py` | 70-79 | 新增冻结开关、白名单名称缓存与非法组合检查 |
+| 同上 | 221 | pretrained MAR 加载完成后调用冻结配置 |
+| 同上 | 243-276 | 新增白名单判断与选择性冻结实现 |
+| `unified_video_action/config/uva_libero10_jepa2_1_small_token_feat_frozen_mar.yaml` | 1-23 | 新增完整 V3 Hydra 配置 |
+| `scripts/training/train_uva_libero10_jepa2_1_small_token_feat_frozen_mar.sh` | 1-76 | 新增完整 V3 启动脚本 |
+| `docs/jepa2_1_latent_alignment_changes.md` | 版本表、第 15 节 | 新增 V3 设计、验证、运行与本审核清单 |
+
+没有修改 `mar_con_unified.py`、workspace、optimizer、EMA、action loss、student tokenizer、JEPA teacher 或 dataset。
+
+#### 15.10.2 policy：新增配置字段与校验
+
+位置：`UnifiedVideoActionPolicy.__init__()` 第 70-79 行。
+
+```python
+self.freeze_mar = bool(kwargs.get("freeze_mar", False))
+self.keep_mar_pos_and_fake_trainable = bool(
+    kwargs.get("keep_mar_pos_and_fake_trainable", False)
+)
+self.mar_trainable_parameter_names = ()
+
+if self.keep_mar_pos_and_fake_trainable and not self.freeze_mar:
+    raise ValueError(
+        "keep_mar_pos_and_fake_trainable=True requires freeze_mar=True."
+    )
+```
+
+作用：两个开关默认都是 false，旧配置完全不受影响；禁止在不冻结 MAR 时单独开启白名单模式。
+
+#### 15.10.3 policy：冻结调用时机
+
+位置：`UnifiedVideoActionPolicy.__init__()` 第 213-221 行。
+
+```python
+self.pretrained_model_path = autoregressive_model_params.pretrained_model_path
+if self.pretrained_model_path is not None:
+    if os.path.exists(self.pretrained_model_path):
+        self.load_pretrained_model()
+    else:
+        print("pretrained model not found: ", self.pretrained_model_path)
+
+self._configure_mar_trainability()
+```
+
+关键点：冻结发生在 checkpoint 加载之后，position embedding 与 fake token 保留 pretrained 数值，不重新初始化。
+
+#### 15.10.4 policy：完整白名单与冻结方法
+
+位置：`UnifiedVideoActionPolicy` 第 243-276 行。
+
+```python
+@staticmethod
+def _is_mar_pos_or_fake_parameter(name: str) -> bool:
+    leaf_name = name.rsplit(".", 1)[-1]
+    return (
+        leaf_name.startswith("fake_")
+        or leaf_name.endswith("_pos_embed")
+        or leaf_name in {
+            "diffusion_temporal_embed",
+            "diffusion_spatial_embed",
+            "mask_token",
+            "blank_token",
+        }
+    )
+
+def _configure_mar_trainability(self) -> None:
+    if not self.freeze_mar:
+        return
+
+    # Keep the MAR graph differentiable with respect to student latents; only
+    # parameter gradients are disabled for the frozen modules.
+    self.model.requires_grad_(False)
+    if self.keep_mar_pos_and_fake_trainable:
+        for name, param in self.model.named_parameters():
+            if self._is_mar_pos_or_fake_parameter(name):
+                param.requires_grad = True
+
+    self.mar_trainable_parameter_names = tuple(
+        name for name, param in self.model.named_parameters() if param.requires_grad
+    )
+    if (
+        self.keep_mar_pos_and_fake_trainable
+        and not self.mar_trainable_parameter_names
+    ):
+        raise RuntimeError("No trainable MAR position or fake parameters were found.")
+```
+
+#### 15.10.5 未修改但直接决定行为的原代码
+
+| 位置 | 原行为 | V3 中的结果 |
+|---|---|---|
+| policy 476-478 `add_weight_decay()` | 跳过 `requires_grad=False` 参数 | frozen MAR 自动不进入 AdamW |
+| policy 496-504 `get_optimizer()` | 复用同一参数分组函数 | 白名单、student、align projector 进入 AdamW |
+| policy 760-768 `self.model(...)` | 正常执行 MAR 前向 | 没有 `no_grad`，梯度仍返回 student latent |
+| policy 777-779 DDP safety | 只连接 `requires_grad=True` 参数 | 只连接 MAR 白名单，不连接 frozen blocks/heads |
+| workspace EMA step | frozen 参数直接复制、trainable 参数做 EMA | MAR 主体固定，白名单/student/projector 做 EMA |
+
+#### 15.10.6 V3 配置全文
+
+文件：`unified_video_action/config/uva_libero10_jepa2_1_small_token_feat_frozen_mar.yaml`。
+
+```yaml
+# V-JEPA 2.1 token-feature alignment with the MAR core and heads frozen.
+name: uva_libero10_jepa2_1_small_token_feat_frozen_mar
+
+defaults:
+  - uva_libero10_jepa2_1_small_token_feat
+  - _self_
+
+model:
+  policy:
+    freeze_mar: true
+    keep_mar_pos_and_fake_trainable: true
+
+logging:
+  project: uva-repa-jepa
+  name: train_uva_libero10_jepa2_1_small_token_feat_frozen_mar
+  tags:
+    - train_uva_libero10_jepa2_1_small_token_feat_frozen_mar
+    - libero10
+    - jepa2_1_teacher
+    - token_feat_alignment
+    - frozen_mar
+    - trainable_mar_pos_embed
+    - trainable_mar_fake_tokens
+```
+
+#### 15.10.7 V3 脚本全部行段
+
+文件：`scripts/training/train_uva_libero10_jepa2_1_small_token_feat_frozen_mar.sh`，整个 1-76 行均为新增。
+
+| 行号 | 内容 |
+|---|---|
+| 1-2 | Bash 入口与 `set -euo pipefail` |
+| 4-9 | CUDA、动态库与 `MUJOCO_EGL_DEVICE_ID=0` 默认环境 |
+| 11-29 | GPU 0-3、4 进程、batch 8、累积 4、global batch 128 校验 |
+| 31-42 | VAE、MAR checkpoint、JEPA checkpoint 与数据路径检查 |
+| 44-54 | Accelerate 可执行文件选择和检查 |
+| 56-62 | 独立的 frozen-MAR run name、run directory 与启动摘要 |
+| 64-76 | Accelerate launch 参数和 V3 Hydra config 选择 |
+
+最终实验参数与 launch 核心内容：
+
+```bash
+GPU_IDS="${GPU_IDS:-0,1,2,3}"
+NUM_PROCESSES="${NUM_PROCESSES:-4}"
+PER_DEVICE_BATCH="${PER_DEVICE_BATCH:-8}"
+GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-4}"
+LR_WARMUP_STEPS="${LR_WARMUP_STEPS:-2000}"
+
+RUN_NAME="${RUN_NAME:-uva_libero10_jepa2_1_small_token_feat_frozen_mar_$(date +%Y%m%d_%H%M%S)}"
+RUN_DIR="${RUN_DIR:-checkpoints/${RUN_NAME}}"
+
+--config-name=uva_libero10_jepa2_1_small_token_feat_frozen_mar.yaml
+training.gradient_accumulate_every="${GRAD_ACCUM_STEPS}"
+training.lr_warmup_steps="${LR_WARMUP_STEPS}"
+training.resume=False
+hydra.run.dir="${RUN_DIR}"
+```
+
+#### 15.10.8 推荐审核命令
+
+V3 提交完成后，可用以下命令查看全部且仅包含 V3 的修改：
+
+```bash
+git diff 323ba5c..HEAD -- unified_video_action/policy/unified_video_action_policy.py
+git diff 323ba5c..HEAD -- unified_video_action/config/uva_libero10_jepa2_1_small_token_feat_frozen_mar.yaml
+git diff 323ba5c..HEAD -- scripts/training/train_uva_libero10_jepa2_1_small_token_feat_frozen_mar.sh
+git diff 323ba5c..HEAD -- docs/jepa2_1_latent_alignment_changes.md
+git show --stat --oneline HEAD
+```

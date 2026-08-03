@@ -67,6 +67,16 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
         self.align_params = kwargs.get("align_params", {})
         self.teacher_type = str(kwargs.get("teacher_type", "vae")).lower()
         self.jepa_teacher_params = kwargs.get("jepa_teacher_params", {})
+        self.freeze_mar = bool(kwargs.get("freeze_mar", False))
+        self.keep_mar_pos_and_fake_trainable = bool(
+            kwargs.get("keep_mar_pos_and_fake_trainable", False)
+        )
+        self.mar_trainable_parameter_names = ()
+
+        if self.keep_mar_pos_and_fake_trainable and not self.freeze_mar:
+            raise ValueError(
+                "keep_mar_pos_and_fake_trainable=True requires freeze_mar=True."
+            )
 
         # Alignment defaults are intentionally conservative for stable joint training.
         self.use_alignment = bool(self.align_params.get("enable", False))
@@ -207,6 +217,8 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
                 self.load_pretrained_model()
             else:
                 print('pretrained model not found: ', self.pretrained_model_path)
+
+        self._configure_mar_trainability()
         
         self.normalizer = LinearNormalizer()
 
@@ -227,6 +239,41 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
         print("----------------------------------------------------------------------")
         print("task_modes", self.task_modes)
         print("----------------------------------------------------------------------")
+
+    @staticmethod
+    def _is_mar_pos_or_fake_parameter(name: str) -> bool:
+        leaf_name = name.rsplit(".", 1)[-1]
+        return (
+            leaf_name.startswith("fake_")
+            or leaf_name.endswith("_pos_embed")
+            or leaf_name in {
+                "diffusion_temporal_embed",
+                "diffusion_spatial_embed",
+                "mask_token",
+                "blank_token",
+            }
+        )
+
+    def _configure_mar_trainability(self) -> None:
+        if not self.freeze_mar:
+            return
+
+        # Keep the MAR graph differentiable with respect to student latents; only
+        # parameter gradients are disabled for the frozen modules.
+        self.model.requires_grad_(False)
+        if self.keep_mar_pos_and_fake_trainable:
+            for name, param in self.model.named_parameters():
+                if self._is_mar_pos_or_fake_parameter(name):
+                    param.requires_grad = True
+
+        self.mar_trainable_parameter_names = tuple(
+            name for name, param in self.model.named_parameters() if param.requires_grad
+        )
+        if (
+            self.keep_mar_pos_and_fake_trainable
+            and not self.mar_trainable_parameter_names
+        ):
+            raise RuntimeError("No trainable MAR position or fake parameters were found.")
 
     def load_pretrained_model(self):
         print("----------------------------------------------------------------------")
