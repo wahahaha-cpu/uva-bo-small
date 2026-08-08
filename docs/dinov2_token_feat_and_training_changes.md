@@ -195,17 +195,17 @@ training:
 
 ```text
 config: unified_video_action/config/uva_libero10_dinov2_small_token_feat_video_pretrained_conv_fc_action.yaml
-tmux session: uva_dinov2_4gpu_video_conv_fc
-run directory: checkpoints/uva_libero10_dinov2_small_token_feat_video_pretrained_conv_fc_action_20260809_000346
-layout: 4 GPU × batch 8 × accumulation 4 = global batch 128
+tmux session: uva_dinov2_8gpu_video_conv_fc
+run directory: checkpoints/uva_libero10_dinov2_small_token_feat_video_pretrained_conv_fc_action_20260809_003124
+layout: 8 GPU × batch 16 × accumulation 1 = global batch 128
 ```
 
 查看训练：
 
 ```bash
-tmux attach -t uva_dinov2_4gpu_video_conv_fc
+tmux attach -t uva_dinov2_8gpu_video_conv_fc
 # 或不进入会话：
-tmux capture-pane -pt uva_dinov2_4gpu_video_conv_fc:0 -S -80
+tmux capture-pane -pt uva_dinov2_8gpu_video_conv_fc:0 -S -80
 ```
 
 ## 8. Git 同步状态
