@@ -82,6 +82,7 @@ updates_per_epoch = ceil(local_batches / gradient_accumulate_every)
 - `unified_video_action/config/uva_libero10_dinov2_small_token_feat.yaml`：DINOv2 token-feature 配置，warmup=2000 optimizer updates。
 - `unified_video_action/config/uva_libero10_dinov2_small_token_feat_fully_frozen_action.yaml`：冻结 MAR、加载 action head 的运行配置。
 - `unified_video_action/config/uva_libero10_dinov2_small_token_feat_video_pretrained_action.yaml`：加载 `libero10_video.ckpt`、不冻结 MAR，并启用 `conv_ori` action head 的运行配置。
+- `unified_video_action/config/uva_libero10_dinov2_small_token_feat_video_pretrained_conv_fc_action.yaml`：当前运行配置；继承前者，但改用 `conv_fc` action head。
 - `scripts/training/train_uva_libero10_dinov2_small_token_feat_fully_frozen_action.sh`：检查权重/数据、自动选择空闲 GPU，并保持 global batch 128。
 - `scripts/verify_dinov2_token_feat.py`：DINO/student/projector 离线 smoke test。
 - `scripts/verify_gradient_lr_equivalence.py`：CPU 双布局梯度和 LR 等价性 oracle。
@@ -180,31 +181,31 @@ model:
       pretrained_model_path: checkpoints/libero10_video.ckpt
     action_model_params:
       predict_action: true
-      act_model_type: conv_ori
+      act_model_type: conv_fc
     selected_training_mode: policy_model
 training:
   resume: false
 ```
 
-视频 checkpoint 不含 action head，因此 `conv_ori` action head 会随机初始化；MAR
+视频 checkpoint 不含 action head，因此 `conv_fc` action head 会随机初始化；MAR
 主体从视频 checkpoint 加载后与 action head、student 和 alignment projector 一起训练。
 `training.resume=false` 是必要的，避免误接上旧 frozen-MAR 或旧 scheduler 状态。
 
 本次实际运行：
 
 ```text
-config: unified_video_action/config/uva_libero10_dinov2_small_token_feat_video_pretrained_action.yaml
-tmux session: uva_dinov2_8gpu_video
-run directory: checkpoints/uva_libero10_dinov2_small_token_feat_video_pretrained_action_20260808_232555
-layout: 8 GPU × batch 16 × accumulation 1 = global batch 128
+config: unified_video_action/config/uva_libero10_dinov2_small_token_feat_video_pretrained_conv_fc_action.yaml
+tmux session: uva_dinov2_4gpu_video_conv_fc
+run directory: checkpoints/uva_libero10_dinov2_small_token_feat_video_pretrained_conv_fc_action_20260809_000346
+layout: 4 GPU × batch 8 × accumulation 4 = global batch 128
 ```
 
 查看训练：
 
 ```bash
-tmux attach -t uva_dinov2_8gpu_video
+tmux attach -t uva_dinov2_4gpu_video_conv_fc
 # 或不进入会话：
-tmux capture-pane -pt uva_dinov2_8gpu_video:0 -S -80
+tmux capture-pane -pt uva_dinov2_4gpu_video_conv_fc:0 -S -80
 ```
 
 ## 8. Git 同步状态

@@ -1,0 +1,27 @@
+# Full-MAR action fine-tuning from the video-only checkpoint, with the original
+# conv_fc action adapter. The checkpoint has no action head, so this branch is
+# initialized by PyTorch and trained together with the unfrozen MAR.
+name: uva_libero10_dinov2_small_token_feat_video_pretrained_conv_fc_action
+
+defaults:
+  - uva_libero10_dinov2_small_token_feat_video_pretrained_action
+  - _self_
+
+model:
+  policy:
+    action_model_params:
+      act_model_type: conv_fc
+
+training:
+  resume: false
+
+logging:
+  name: train_uva_libero10_dinov2_small_token_feat_video_pretrained_conv_fc_action
+  tags:
+    - train_uva_libero10_dinov2_small_token_feat_video_pretrained_conv_fc_action
+    - libero10
+    - dinov2_vits14_teacher
+    - token_feat_alignment
+    - video_pretrained_mar
+    - full_mar_finetune
+    - randomly_initialized_conv_fc_action_head
