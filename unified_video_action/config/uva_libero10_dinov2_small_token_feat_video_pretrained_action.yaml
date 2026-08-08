@@ -1,0 +1,34 @@
+# DINOv2 token-feature alignment with a video-pretrained, fully trainable MAR.
+# The video checkpoint has no action head; conv_ori is initialized for policy
+# training together with the unfrozen MAR.
+name: uva_libero10_dinov2_small_token_feat_video_pretrained_action
+
+defaults:
+  - uva_libero10_dinov2_small_token_feat
+  - _self_
+
+model:
+  policy:
+    freeze_mar: false
+    keep_mar_pos_and_fake_trainable: false
+    autoregressive_model_params:
+      pretrained_model_path: checkpoints/libero10_video.ckpt
+    action_model_params:
+      predict_action: true
+      act_model_type: conv_ori
+    selected_training_mode: policy_model
+
+training:
+  resume: false
+
+logging:
+  project: uva-repa-dinov2
+  name: train_uva_libero10_dinov2_small_token_feat_video_pretrained_action
+  tags:
+    - train_uva_libero10_dinov2_small_token_feat_video_pretrained_action
+    - libero10
+    - dinov2_vits14_teacher
+    - token_feat_alignment
+    - video_pretrained_mar
+    - full_mar_finetune
+    - randomly_initialized_conv_ori_action_head

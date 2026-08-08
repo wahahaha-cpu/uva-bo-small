@@ -4,17 +4,20 @@
 
 ## 1. 实验定义
 
-当前启动配置是：
+此前的 frozen-MAR action 配置（`uva_libero10_dinov2_small_token_feat_fully_frozen_action.yaml`）是：
 
 ```text
 teacher: DINOv2 ViT-S/14
 alignment: token_feat
 student: small tokenizer, hidden_dim=304
 projector: 304 -> 512 -> 512 -> 384
-MAR: 从 checkpoints/libero10.ckpt 加载，全部冻结
+MAR: 从 `checkpoints/libero10.ckpt` 加载，全部冻结
 action head: conv_ori，要求 checkpoint 中已有完整 action head
 effective global batch: 128
 ```
+
+当前实际训练改用文末的 video-pretrained/full-MAR 配置；DINOv2、student 和
+token-feature 对齐实现不变。
 
 DINOv2 的对齐对象不是 MAR latent，而是 student 最终 encoder 输出的 token feature：
 
@@ -78,6 +81,7 @@ updates_per_epoch = ceil(local_batches / gradient_accumulate_every)
 - `unified_video_action/common/training_utils.py`：统一更新次数和 accumulation window 公式。
 - `unified_video_action/config/uva_libero10_dinov2_small_token_feat.yaml`：DINOv2 token-feature 配置，warmup=2000 optimizer updates。
 - `unified_video_action/config/uva_libero10_dinov2_small_token_feat_fully_frozen_action.yaml`：冻结 MAR、加载 action head 的运行配置。
+- `unified_video_action/config/uva_libero10_dinov2_small_token_feat_video_pretrained_action.yaml`：加载 `libero10_video.ckpt`、不冻结 MAR，并启用 `conv_ori` action head 的运行配置。
 - `scripts/training/train_uva_libero10_dinov2_small_token_feat_fully_frozen_action.sh`：检查权重/数据、自动选择空闲 GPU，并保持 global batch 128。
 - `scripts/verify_dinov2_token_feat.py`：DINO/student/projector 离线 smoke test。
 - `scripts/verify_gradient_lr_equivalence.py`：CPU 双布局梯度和 LR 等价性 oracle。
@@ -162,7 +166,48 @@ tmux attach -t uva_dinov2_8gpu
 tmux capture-pane -pt uva_dinov2_8gpu:0 -S -80
 ```
 
-## 7. Git 同步状态
+## 7. 当前 video-pretrained、MAR 全量训练配置
+
+由于 `checkpoints/libero10_video.ckpt` 是视频预训练权重（`predict_video=true`、
+`predict_action=false`），本实验只需新增配置文件，不需要改训练脚本或模型代码：
+
+```yaml
+model:
+  policy:
+    freeze_mar: false
+    keep_mar_pos_and_fake_trainable: false
+    autoregressive_model_params:
+      pretrained_model_path: checkpoints/libero10_video.ckpt
+    action_model_params:
+      predict_action: true
+      act_model_type: conv_ori
+    selected_training_mode: policy_model
+training:
+  resume: false
+```
+
+视频 checkpoint 不含 action head，因此 `conv_ori` action head 会随机初始化；MAR
+主体从视频 checkpoint 加载后与 action head、student 和 alignment projector 一起训练。
+`training.resume=false` 是必要的，避免误接上旧 frozen-MAR 或旧 scheduler 状态。
+
+本次实际运行：
+
+```text
+config: unified_video_action/config/uva_libero10_dinov2_small_token_feat_video_pretrained_action.yaml
+tmux session: uva_dinov2_8gpu_video
+run directory: checkpoints/uva_libero10_dinov2_small_token_feat_video_pretrained_action_20260808_232555
+layout: 8 GPU × batch 16 × accumulation 1 = global batch 128
+```
+
+查看训练：
+
+```bash
+tmux attach -t uva_dinov2_8gpu_video
+# 或不进入会话：
+tmux capture-pane -pt uva_dinov2_8gpu_video:0 -S -80
+```
+
+## 8. Git 同步状态
 
 修改前基线已保存为 commit `1998d92`，并在最终修改前同步到 GitHub：
 
@@ -170,4 +215,5 @@ tmux capture-pane -pt uva_dinov2_8gpu:0 -S -80
 small/jepa2_1_token_feat_fully_frozen_mar -> 1998d92
 ```
 
-最终 DINOv2 修改会在完成验证后作为后续 commit 推送到同一分支，因此 GitHub 历史中仍能单独取出修改前基线。
+当前 video-pretrained 配置和本文更新作为后续 commit 推送到同一分支，因此 GitHub
+历史中仍能单独取出修改前基线与 frozen-MAR 版本。
