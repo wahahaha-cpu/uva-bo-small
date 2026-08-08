@@ -1,20 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Libero rollout needs MuJoCo/NVIDIA runtime libraries. Accelerate imports
-# DeepSpeed while unwrapping the EMA model, which requires a CUDA toolkit root.
 export CUDA_HOME="${CUDA_HOME:-/data1/local_userdata/jinboning/conda/envs/repa}"
 export PATH="${CUDA_HOME}/bin:${PATH}"
 export LD_LIBRARY_PATH="${CUDA_HOME}/lib:/usr/lib/nvidia:/home/jinboning/.mujoco/mujoco210/bin:${LD_LIBRARY_PATH:-}"
 export MUJOCO_EGL_DEVICE_ID="${MUJOCO_EGL_DEVICE_ID:-0}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 
-# Default experiment: GPUs 0,1,2,3 x batch 8 x accumulation 4 = global batch 128.
+# Preserve the original run's optimization setup exactly.
 GPU_IDS="${GPU_IDS:-0,1,2,3}"
 NUM_PROCESSES="${NUM_PROCESSES:-4}"
 PER_DEVICE_BATCH="${PER_DEVICE_BATCH:-8}"
 GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-4}"
 EXPECTED_GLOBAL_BATCH="${EXPECTED_GLOBAL_BATCH:-128}"
 LR_WARMUP_STEPS="${LR_WARMUP_STEPS:-2000}"
+
+RUN_DIR="${RUN_DIR:-checkpoints/uva_libero10_jepa2_1_small_token_feat_20260731_153521}"
+RESUME_CHECKPOINT="${RUN_DIR}/checkpoints/latest.ckpt"
 
 IFS=',' read -r -a GPU_ID_ARRAY <<< "${GPU_IDS}"
 if (( ${#GPU_ID_ARRAY[@]} != NUM_PROCESSES )); then
@@ -33,6 +35,7 @@ required_paths=(
     checkpoints/libero10_video.ckpt
     pretrained_models/jepa/vjepa2_1_vitb_dist_vitG_384.pt
     data/libero_10
+    "${RESUME_CHECKPOINT}"
 )
 for required_path in "${required_paths[@]}"; do
     if [[ ! -e "${required_path}" ]]; then
@@ -53,13 +56,10 @@ if [[ "${ACCELERATE_BIN}" != "accelerate" && ! -x "${ACCELERATE_BIN}" ]]; then
     exit 1
 fi
 
-RUN_NAME="${RUN_NAME:-uva_libero10_jepa2_1_small_token_feat_$(date +%Y%m%d_%H%M%S)}"
-RUN_DIR="${RUN_DIR:-checkpoints/${RUN_NAME}}"
-
-echo "JEPA config: uva_libero10_jepa2_1_small_token_feat.yaml"
+echo "Resume checkpoint: ${RESUME_CHECKPOINT}"
+echo "Expected saved state: epoch=140, global_step=547220"
 echo "GPUs: ${GPU_IDS}"
 echo "Global batch: ${NUM_PROCESSES} x ${PER_DEVICE_BATCH} x ${GRAD_ACCUM_STEPS} = ${GLOBAL_BATCH}"
-echo "Run directory: ${RUN_DIR}"
 
 launch_args=(
     --num_processes="${NUM_PROCESSES}"
@@ -70,7 +70,7 @@ launch_args=(
     val_dataloader.batch_size="${PER_DEVICE_BATCH}"
     training.gradient_accumulate_every="${GRAD_ACCUM_STEPS}"
     training.lr_warmup_steps="${LR_WARMUP_STEPS}"
-    training.resume=False
+    training.resume=True
     hydra.run.dir="${RUN_DIR}"
 )
 CUDA_VISIBLE_DEVICES="${GPU_IDS}" "${ACCELERATE_BIN}" launch "${launch_args[@]}"

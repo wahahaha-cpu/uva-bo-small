@@ -12,6 +12,7 @@ model:
       use_projector: true
 
 logging:
+  project: uva-repa-jepa
   name: train_uva_libero10_jepa2_1_small_token_feat
   tags:
     - train_uva_libero10_jepa2_1_small_token_feat
