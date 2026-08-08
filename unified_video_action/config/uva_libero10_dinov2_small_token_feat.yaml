@@ -1,0 +1,35 @@
+# Libero10 small policy with local DINOv2-S/14 token-feature alignment.
+name: uva_libero10_dinov2_small_token_feat
+
+defaults:
+  - uva_libero10_jepa2_1_small_token_feat
+  - _self_
+
+model:
+  policy:
+    use_student_tokenizer: true
+    teacher_type: dinov2
+    dinov2_teacher_params:
+      model_name: dinov2_vits14
+      img_size: 224
+      model_img_size: 518
+      checkpoint_path: pretrained_models/dinov2/dinov2_vits14_pretrain.pth
+      loader: timm
+    align_params:
+      align_on: token_feat
+      use_projector: true
+
+logging:
+  project: uva-repa-dinov2
+  name: train_uva_libero10_dinov2_small_token_feat
+  tags:
+    - train_uva_libero10_dinov2_small_token_feat
+    - libero10
+    - dinov2_vits14_teacher
+    - token_feat_alignment
+
+training:
+  # All scheduler quantities are optimizer-update counts (not micro-batches).
+  # This keeps 4-GPU x 8 x accumulation-4 and 8-GPU x 16 x accumulation-1
+  # on the same warmup curve for the effective global batch of 128.
+  lr_warmup_steps: 2000

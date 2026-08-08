@@ -1,0 +1,30 @@
+# DINOv2 token-feature alignment with all MAR parameters frozen and a
+# checkpointed conv_ori action head.
+name: uva_libero10_dinov2_small_token_feat_fully_frozen_action
+
+defaults:
+  - uva_libero10_dinov2_small_token_feat
+  - _self_
+
+model:
+  policy:
+    freeze_mar: true
+    keep_mar_pos_and_fake_trainable: false
+    autoregressive_model_params:
+      # A strict MAR freeze must not leave a randomly initialized action head.
+      pretrained_model_path: checkpoints/libero10.ckpt
+    action_model_params:
+      predict_action: true
+      act_model_type: conv_ori
+    selected_training_mode: policy_model
+
+logging:
+  project: uva-repa-dinov2
+  name: train_uva_libero10_dinov2_small_token_feat_fully_frozen_action
+  tags:
+    - train_uva_libero10_dinov2_small_token_feat_fully_frozen_action
+    - libero10
+    - dinov2_vits14_teacher
+    - token_feat_alignment
+    - fully_frozen_mar
+    - pretrained_action_head

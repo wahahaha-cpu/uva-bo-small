@@ -34,6 +34,11 @@ from unified_video_action.dataset.base_dataset import BaseImageDataset
 from unified_video_action.dataset.umi_multi_dataset import UmiMultiDataset
 from unified_video_action.common.checkpoint_util import TopKCheckpointManager
 from unified_video_action.common.pytorch_util import dict_apply
+from unified_video_action.common.training_utils import (
+    accumulation_window,
+    local_batches_per_epoch,
+    optimizer_steps_per_epoch,
+)
 from unified_video_action.model.autoregressive.ema_model import EMAModel
 from unified_video_action.model.common.lr_scheduler import get_scheduler
 from unified_video_action.utils.load_env import load_env_runner, env_rollout
@@ -184,15 +189,66 @@ class TrainUnifiedVideoActionWorkspace(BaseWorkspace):
                 self.ema_model.set_normalizer(normalizer)
         
 
-        # configure lr scheduler
+        # Debug overrides must be applied before deriving the scheduler horizon.
+        if cfg.training.debug:
+            cfg.training.num_epochs = 2
+            cfg.training.max_train_steps = 3
+            cfg.training.max_val_steps = 3
+            cfg.training.rollout_every = 1
+            cfg.training.checkpoint_every = 1
+            cfg.training.val_every = 1
+            cfg.training.sample_every = 1
+
+        accumulation_steps = int(cfg.training.gradient_accumulate_every)
+        if accumulation_steps < 1:
+            raise ValueError("training.gradient_accumulate_every must be >= 1")
+        # ``len(train_dataloader)`` is global before prepare() and local after
+        # prepare().  Derive the local count explicitly so scheduler horizon is
+        # independent of world size while still matching Accelerate's sharding.
+        batches_before_prepare = len(train_dataloader)
+        local_batch_count = local_batches_per_epoch(
+            batches_before_prepare,
+            accelerator.num_processes,
+            split_batches=accelerator.split_batches,
+        )
+        updates_per_epoch = optimizer_steps_per_epoch(
+            batches_before_prepare,
+            accelerator.num_processes,
+            accumulation_steps,
+            split_batches=accelerator.split_batches,
+        )
+        total_optimizer_steps = updates_per_epoch * int(cfg.training.num_epochs)
+        if cfg.training.max_train_steps is not None:
+            if int(cfg.training.max_train_steps) < 1:
+                raise ValueError("training.max_train_steps must be >= 1 or null")
+            total_optimizer_steps = min(
+                total_optimizer_steps, int(cfg.training.max_train_steps)
+            )
+
+        warmup_steps = int(cfg.training.lr_warmup_steps)
+        if warmup_steps < 0:
+            raise ValueError("training.lr_warmup_steps must be >= 0")
+        if total_optimizer_steps < 1:
+            raise ValueError("Training must contain at least one optimizer update")
+        accelerator.print(
+            "Optimizer-step schedule: "
+            f"batches_before_prepare={batches_before_prepare}, "
+            f"local_batches_per_epoch={local_batch_count}, "
+            f"accumulation_steps={accumulation_steps}, "
+            f"updates_per_epoch={updates_per_epoch}, "
+            f"warmup_updates={warmup_steps}, "
+            f"total_updates={total_optimizer_steps}"
+        )
+
+        # Keep this scheduler unwrapped.  Accelerate's wrapped scheduler advances
+        # once per process for a non-split dataloader, which makes a 4-GPU run and
+        # an 8-GPU run follow different LR curves.  We call it exactly once per
+        # optimizer update below, independent of world size.
         self.lr_scheduler = get_scheduler(
             cfg.training.lr_scheduler,
             optimizer=self.optimizer,
-            num_warmup_steps=cfg.training.lr_warmup_steps,
-            num_training_steps=(len(train_dataloader) * cfg.training.num_epochs)
-            // cfg.training.gradient_accumulate_every,
-            # pytorch assumes stepping LRScheduler every epoch
-            # however huggingface diffusers steps it every batch
+            num_warmup_steps=warmup_steps,
+            num_training_steps=total_optimizer_steps,
             last_epoch=self.global_step - 1,
         )
 
@@ -223,37 +279,39 @@ class TrainUnifiedVideoActionWorkspace(BaseWorkspace):
             save_dir=os.path.join(self.output_dir, "checkpoints"), **cfg.checkpoint.topk
         )
 
-        # accelerator
+        # accelerator (the scheduler intentionally stays a plain scheduler)
         (
             train_dataloader,
             val_dataloader,
             self.model,
             self.optimizer,
-            self.lr_scheduler,
         ) = accelerator.prepare(
             train_dataloader,
             val_dataloader,
             self.model,
             self.optimizer,
-            self.lr_scheduler,
         )
+        actual_local_batches = len(train_dataloader)
+        if actual_local_batches != local_batch_count:
+            raise RuntimeError(
+                "Accelerate dataloader sharding did not match the scheduler "
+                f"horizon: predicted={local_batch_count}, "
+                f"actual={actual_local_batches}."
+            )
 
         device = self.model.device
 
         if self.ema_model is not None:
             self.ema_model.to(device)
 
-        if cfg.training.debug:
-            cfg.training.num_epochs = 2
-            cfg.training.max_train_steps = 3
-            cfg.training.max_val_steps = 3
-            cfg.training.rollout_every = 1
-            cfg.training.checkpoint_every = 1
-            cfg.training.val_every = 1
-            cfg.training.sample_every = 1
-
         # training loop
+        stop_training = (
+            cfg.training.max_train_steps is not None
+            and self.global_step >= int(cfg.training.max_train_steps)
+        )
         for local_epoch_idx in range(cfg.training.num_epochs):
+            if stop_training:
+                break
             step_log = dict()
             print(self.output_dir)
 
@@ -265,7 +323,14 @@ class TrainUnifiedVideoActionWorkspace(BaseWorkspace):
                 leave=False,
                 mininterval=cfg.training.tqdm_interval_sec,
             ) as tepoch:
+                num_batches = len(train_dataloader)
+                self.optimizer.zero_grad(set_to_none=True)
                 for batch_idx, batch in enumerate(tepoch):
+                    _, _, window_size, is_update_step = accumulation_window(
+                        batch_idx,
+                        num_batches,
+                        accumulation_steps,
+                    )
 
                     # device transfer
                     batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
@@ -281,17 +346,28 @@ class TrainUnifiedVideoActionWorkspace(BaseWorkspace):
                     else:
                         raw_loss, (loss_diffusion, loss_action) = self.model(batch)
 
-                    accelerator.backward(raw_loss)
+                    # Average gradients over the effective global batch.  The old
+                    # code summed micro-batch means, multiplying the update by K
+                    # for 4-GPU x accumulation-4 versus 8-GPU x accumulation-1.
+                    scaled_loss = raw_loss / float(window_size)
+                    if is_update_step:
+                        accelerator.backward(scaled_loss)
+                    else:
+                        with accelerator.no_sync(self.model):
+                            accelerator.backward(scaled_loss)
 
-                    # step optimizer
-                    if self.global_step % cfg.training.gradient_accumulate_every == 0:
+                    # One optimizer/LR/EMA update per completed accumulation window.
+                    optimizer_step_succeeded = False
+                    if is_update_step:
                         self.optimizer.step()
-                        self.optimizer.zero_grad()
-                        self.lr_scheduler.step()
-
-                    # update ema
-                    if cfg.training.use_ema:
-                        ema.step(accelerator.unwrap_model(self.model))
+                        self.optimizer.zero_grad(set_to_none=True)
+                        optimizer_step_succeeded = not bool(
+                            getattr(self.optimizer, "step_was_skipped", False)
+                        )
+                        if optimizer_step_succeeded:
+                            self.lr_scheduler.step()
+                            if cfg.training.use_ema:
+                                ema.step(accelerator.unwrap_model(self.model))
 
                     # logging
                     raw_loss_cpu = raw_loss.item()
@@ -314,6 +390,11 @@ class TrainUnifiedVideoActionWorkspace(BaseWorkspace):
                         "diffusion_loss": loss_diffusion_cpu,
                         "action_loss": loss_action_cpu,
                         "global_step": self.global_step,
+                        "optimizer_step": self.global_step,
+                        "micro_step": batch_idx,
+                        "optimizer_step_skipped": float(
+                            is_update_step and not optimizer_step_succeeded
+                        ),
                         "epoch": self.epoch,
                         "lr": self.lr_scheduler.get_last_lr()[0],
                     }
@@ -327,14 +408,16 @@ class TrainUnifiedVideoActionWorkspace(BaseWorkspace):
                                 elif isinstance(value, (float, int)):
                                     step_log[key] = float(value)
 
-                    is_last_batch = batch_idx == (len(train_dataloader) - 1)
-                    if not is_last_batch:
+                    if is_update_step:
                         accelerator.log(step_log, step=self.global_step)
-                        self.global_step += 1
+                        if optimizer_step_succeeded:
+                            self.global_step += 1
 
-                    if (cfg.training.max_train_steps is not None) and batch_idx >= (
-                        cfg.training.max_train_steps - 1
+                    if (
+                        cfg.training.max_train_steps is not None
+                        and self.global_step >= int(cfg.training.max_train_steps)
                     ):
+                        stop_training = True
                         break
 
             train_loss = np.mean(train_losses)
@@ -416,7 +499,6 @@ class TrainUnifiedVideoActionWorkspace(BaseWorkspace):
             # ========= eval end for this epoch ==========
             policy.train()
             accelerator.log(step_log, step=self.global_step)
-            self.global_step += 1
             self.epoch += 1
 
         accelerator.end_training()

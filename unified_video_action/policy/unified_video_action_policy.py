@@ -28,6 +28,7 @@ from unified_video_action.utils.language_model import (
     get_text_model,
     extract_text_features,
 )
+from unified_video_action.model.common.dinov2_teacher import DINOv2Teacher
 from unified_video_action.model.common.jepa_teacher import JEPATeacher
 from unified_video_action.model.common.student_tokenizer import StudentLatentTokenizer
 
@@ -66,6 +67,7 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
         self.student_tokenizer_params = kwargs.get("student_tokenizer_params", None)
         self.align_params = kwargs.get("align_params", {})
         self.teacher_type = str(kwargs.get("teacher_type", "vae")).lower()
+        self.dinov2_teacher_params = kwargs.get("dinov2_teacher_params", {})
         self.jepa_teacher_params = kwargs.get("jepa_teacher_params", {})
         self.freeze_mar = bool(kwargs.get("freeze_mar", False))
         self.keep_mar_pos_and_fake_trainable = bool(
@@ -95,20 +97,26 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
         ).lower()
         self._last_align_metrics = {}
 
-        if self.teacher_type not in ("vae", "jepa"):
+        if self.teacher_type not in ("vae", "jepa", "dinov2"):
             raise ValueError(
                 f"Unsupported teacher_type={self.teacher_type!r}. "
-                "Expected 'vae' or 'jepa'."
+                "Expected 'vae', 'jepa', or 'dinov2'."
             )
-        if self.teacher_type == "jepa":
+        if self.teacher_type in ("jepa", "dinov2"):
             if not self.use_student_tokenizer:
                 raise ValueError(
-                    "teacher_type='jepa' requires use_student_tokenizer=True."
+                    f"teacher_type={self.teacher_type!r} requires "
+                    "use_student_tokenizer=True."
                 )
             if self.align_on not in ("latent", "token_feat"):
                 raise ValueError(
-                    "JEPA alignment requires align_on='latent' or 'token_feat'."
+                    f"{self.teacher_type} alignment requires "
+                    "align_on='latent' or 'token_feat'."
                 )
+        if self.teacher_type == "dinov2" and self.align_on != "token_feat":
+            raise ValueError(
+                "This DINOv2 experiment requires align_on='token_feat'."
+            )
 
         ## =========================== load vae model ===========================
         with torch.no_grad():
@@ -117,11 +125,17 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
         for param in self.vae_model.parameters():
             param.requires_grad = False
 
-        # =========================== JEPA teacher ===========================
+        # =========================== frozen alignment teacher ===========================
+        self.dinov2_teacher = None
         self.jepa_teacher = None
+        self.teacher_feat_dim = None
         self.teacher_latent_projector = None
         if self.teacher_type == "jepa":
             self.jepa_teacher = JEPATeacher(**self.jepa_teacher_params)
+            self.teacher_feat_dim = self.jepa_teacher.feat_dim
+        elif self.teacher_type == "dinov2":
+            self.dinov2_teacher = DINOv2Teacher(**self.dinov2_teacher_params)
+            self.teacher_feat_dim = self.dinov2_teacher.feat_dim
 
         # =========================== student tokenizer ===========================
         self.student_tokenizer = None
@@ -132,7 +146,7 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
                     "use_student_tokenizer=True but student_tokenizer_params is not provided."
                 )
             self.student_tokenizer = StudentLatentTokenizer(**self.student_tokenizer_params)
-            if self.use_alignment and self.teacher_type == "jepa":
+            if self.use_alignment and self.teacher_type in ("jepa", "dinov2"):
                 self.align_use_projector = self.align_on == "token_feat"
                 if self.align_on == "latent":
                     latent_dim = int(
@@ -142,7 +156,7 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
                     )
                     self.teacher_latent_projector = torch.nn.Sequential(
                         torch.nn.Linear(
-                            self.jepa_teacher.feat_dim, self.align_projector_dim
+                            self.teacher_feat_dim, self.align_projector_dim
                         ),
                         torch.nn.SiLU(),
                         torch.nn.Linear(
@@ -159,8 +173,8 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
                     )
                 )
                 align_target_dim = latent_dim
-                if self.teacher_type == "jepa":
-                    align_target_dim = self.jepa_teacher.feat_dim
+                if self.teacher_type in ("jepa", "dinov2"):
+                    align_target_dim = self.teacher_feat_dim
                 self.align_projector = torch.nn.Sequential(
                     torch.nn.Linear(hidden_dim, self.align_projector_dim),
                     torch.nn.SiLU(),
@@ -555,7 +569,7 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
         bsz, timesteps, student_token_count, _ = student_tokens.shape
         if bsz != teacher_tokens.shape[0] or timesteps != teacher_tokens.shape[1]:
             raise ValueError(
-                "JEPA/student batch or time mismatch: "
+                "Teacher/student batch or time mismatch: "
                 f"student={student_tokens.shape}, teacher={teacher_tokens.shape}"
             )
 
@@ -569,7 +583,7 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
             )
         if teacher_side * teacher_side != teacher_token_count:
             raise ValueError(
-                f"JEPA token count {teacher_token_count} is not a square grid."
+                f"Teacher token count {teacher_token_count} is not a square grid."
             )
 
         teacher_map = teacher_tokens.reshape(
@@ -701,9 +715,14 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
                     proprioception_input["pred_second_image_z"] = pred_second_image_z
 
             if self.use_alignment:
-                if self.teacher_type == "jepa":
-                    teacher_z_tokens = self.jepa_teacher.extract_tokens(x_img)
-                    teacher_c_tokens = self.jepa_teacher.extract_tokens(c_img)
+                if self.teacher_type in ("jepa", "dinov2"):
+                    teacher = (
+                        self.jepa_teacher
+                        if self.teacher_type == "jepa"
+                        else self.dinov2_teacher
+                    )
+                    teacher_z_tokens = teacher.extract_tokens(x_img)
+                    teacher_c_tokens = teacher.extract_tokens(c_img)
                     if self.align_on == "latent":
                         student_z_tokens = self._latent_to_tokens(z)
                         student_c_tokens = self._latent_to_tokens(c)
