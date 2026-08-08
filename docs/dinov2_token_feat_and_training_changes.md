@@ -146,6 +146,22 @@ bash scripts/training/train_uva_libero10_dinov2_small_token_feat_fully_frozen_ac
 
 训练输出目录由 `RUN_DIR` 控制，默认在 `checkpoints/`（该目录是本机外部存储的 symlink，不会提交到 Git）。
 
+本次已实际启动：
+
+```text
+tmux session: uva_dinov2_8gpu
+run directory: checkpoints/uva_libero10_dinov2_small_token_feat_fully_frozen_action_20260808_230315
+layout: 8 GPU × batch 16 × accumulation 1
+```
+
+启动后已稳定通过初始化并在 epoch 0 跑过 130 个以上 optimizer update，八张卡均在计算。可用下面命令查看：
+
+```bash
+tmux attach -t uva_dinov2_8gpu
+# 或不进入会话：
+tmux capture-pane -pt uva_dinov2_8gpu:0 -S -80
+```
+
 ## 7. Git 同步状态
 
 修改前基线已保存为 commit `1998d92`，并在最终修改前同步到 GitHub：
