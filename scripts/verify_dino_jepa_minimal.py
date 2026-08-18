@@ -171,6 +171,19 @@ def main() -> None:
         assert torch.isfinite(value).all(), f"Non-finite {label}: {value}"
     assert torch.isfinite(video_loss).all()
     assert torch.isfinite(action_loss).all()
+    alignment_metrics = {}
+    for key in (
+        "dino_cos",
+        "dino_mse",
+        "dino_stats",
+        "jepa_dynamics_cos",
+        "jepa_dynamics_mse",
+        "jepa_dynamics_stats",
+    ):
+        value = policy._last_align_metrics.get(key)
+        if value is not None:
+            assert torch.isfinite(value).all(), f"Non-finite {key}: {value}"
+            alignment_metrics[key] = value.detach().float().item()
 
     student_parameters = tuple(policy.student_tokenizer.parameters())
     component_gradient_norms = {
@@ -287,6 +300,7 @@ def main() -> None:
         f"total={components['total_loss'].detach().float().item():.8f}"
     )
     print(f"component_gradient_norms: {component_gradient_norms}")
+    print(f"alignment_metrics: {alignment_metrics}")
     print(f"module_gradients: {module_summaries}")
     print(f"teacher_status: {teacher_status}")
     print(f"temporal_sanity: {temporal_metrics}")

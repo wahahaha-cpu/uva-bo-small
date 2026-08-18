@@ -1,7 +1,7 @@
 import torch
 import os
 from contextlib import contextmanager
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 import torch.nn.functional as F
 import random
 import numpy as np
@@ -169,6 +169,15 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
         )
         self.dino_stats_coeff = float(
             self.dual_teacher_params.get("dino_stats_coeff", 0.1)
+        )
+        self.jepa_loss_type = str(
+            self.dual_teacher_params.get("jepa_loss_type", "hybrid")
+        ).lower()
+        self.jepa_mse_coeff = float(
+            self.dual_teacher_params.get("jepa_mse_coeff", 0.25)
+        )
+        self.jepa_stats_coeff = float(
+            self.dual_teacher_params.get("jepa_stats_coeff", 0.1)
         )
         self.log_dual_teacher_shapes = bool(
             self.dual_teacher_params.get("log_shapes_once", True)
@@ -987,16 +996,25 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
         )
         dynamics["projected_delta_student"] = projected_delta_student
 
-        projected_float = projected_delta_student.float()
-        target_float = delta_jepa.float()
-        cosine = F.cosine_similarity(
-            projected_float, target_float, dim=-1, eps=1e-6
-        ).mean()
-        jepa_loss = 1.0 - cosine
+        jepa_loss, alignment_metrics = self._compute_feature_alignment_loss(
+            projected_delta_student,
+            delta_jepa.detach(),
+            loss_type=self.jepa_loss_type,
+            mse_coeff=self.jepa_mse_coeff,
+            stats_coeff=self.jepa_stats_coeff,
+        )
         metrics = {
-            "cosine": cosine.detach(),
-            "student_dynamics_norm": projected_float.detach().norm(dim=-1).mean(),
-            "teacher_dynamics_norm": target_float.detach().norm(dim=-1).mean(),
+            "cosine": alignment_metrics["cosine"],
+            "mse": alignment_metrics["mse"],
+            "stats": alignment_metrics["stats"],
+            "student_dynamics_norm": projected_delta_student.detach()
+            .float()
+            .norm(dim=-1)
+            .mean(),
+            "teacher_dynamics_norm": delta_jepa.detach()
+            .float()
+            .norm(dim=-1)
+            .mean(),
         }
         return jepa_loss, metrics, teacher_tokens, delta_jepa, dynamics, metadata
 
@@ -1054,6 +1072,8 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
             metrics.update(
                 {
                     "jepa_dynamics_cos": jepa_metrics["cosine"],
+                    "jepa_dynamics_mse": jepa_metrics["mse"],
+                    "jepa_dynamics_stats": jepa_metrics["stats"],
                     "jepa_student_dynamics_norm": jepa_metrics[
                         "student_dynamics_norm"
                     ],
@@ -1126,6 +1146,7 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
         dino_loss: torch.Tensor,
         jepa_loss: torch.Tensor,
         total_loss: torch.Tensor,
+        alignment_metrics: Optional[Dict[str, torch.Tensor]] = None,
     ) -> None:
         if self._dual_teacher_shapes_logged:
             return
@@ -1165,6 +1186,21 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
             f"total={total_loss.detach().float().item():.6f}",
             flush=True,
         )
+        if alignment_metrics:
+            metric_names = (
+                "dino_cos",
+                "dino_mse",
+                "dino_stats",
+                "jepa_dynamics_cos",
+                "jepa_dynamics_mse",
+                "jepa_dynamics_stats",
+            )
+            logged_metrics = {
+                name: alignment_metrics[name].detach().float().item()
+                for name in metric_names
+                if name in alignment_metrics
+            }
+            print(f"alignment_metrics: {logged_metrics}", flush=True)
 
     def compute_loss(self, batch, **kwargs):
         B, T, C, H, W = batch["obs"]["image"].size()
@@ -1358,6 +1394,7 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
                 dino_loss,
                 jepa_loss,
                 total_loss_without_unused_terms,
+                dual_metrics,
             )
 
         # DDP safety: always attach every trainable parameter to graph.

@@ -8,9 +8,10 @@ L = L_base + lambda_dino * L_dino + lambda_jepa * L_jepa
 ```
 
 The default coefficients are `lambda_dino=0.02` and `lambda_jepa=0.05`.
-The DINO loss is the existing hybrid patch-feature loss. The JEPA loss is a
-cosine loss on temporal changes only. No adaptive gate, VAE alignment, MAR
-change, action-conditioned predictor, or temporal Transformer is used.
+Both teacher branches use the existing hybrid token-feature primitive. DINO
+applies it to absolute per-frame patch features; JEPA applies it to temporal
+changes only. No adaptive gate, VAE alignment, MAR change, action-conditioned
+predictor, or temporal Transformer is used.
 
 ## Data And Forward Flow
 
@@ -62,11 +63,19 @@ student_to_jepa_projector(delta_student)  [B, 256, 768]
 spatial interpolation only                 [B, 576, 768]
 ```
 
-The JEPA objective is:
+The JEPA objective is the same hybrid feature loss used by DINO, but its inputs
+remain temporal changes:
 
 ```text
-L_jepa = 1 - cosine(projected_delta_student, stopgrad(delta_jepa))
+L_jepa = 0.5 * (1 - cosine(P_J(delta_H), stopgrad(delta_J)))
+         + 0.75 * MSE(P_J(delta_H), stopgrad(delta_J))
+         + 0.1 * statistics_loss(P_J(delta_H), stopgrad(delta_J))
 ```
+
+The `.75` coefficient is the helper's `0.5` hybrid MSE term plus the explicit
+`jepa_mse_coeff=0.25`; `jepa_stats_coeff=0.1` compares token-wise mean and
+standard deviation. These coefficients are configurable independently of
+`lambda_jepa`.
 
 ## Changed Files
 
@@ -121,10 +130,10 @@ Observed combined loss values on the first real Libero sample:
 ```text
 base_loss       = 0.94105399
 dino_loss       = 5.16265297
-jepa_loss       = 1.01007223
+jepa_loss       = 0.71486747
 weighted_dino   = 0.10325306
-weighted_jepa   = 0.05050361
-total_loss      = 1.09481061
+weighted_jepa   = 0.03574337
+total_loss      = 1.08005035
 ```
 
 Component gradient norms on Student (before the total backward):
@@ -132,7 +141,18 @@ Component gradient norms on Student (before the total backward):
 ```text
 grad_norm_base  = 0.00000000
 grad_norm_dino  = 0.09952239
-grad_norm_jepa  = 0.18807101
+grad_norm_jepa  = 0.13363297
+```
+
+The hybrid token metrics for the same batch were:
+
+```text
+dino_cos              = -0.01092050
+dino_mse              = 5.48106527
+dino_stats            = 5.46393538
+jepa_dynamics_cos     = -0.01007223
+jepa_dynamics_mse     = 0.25277624
+jepa_dynamics_stats   = 0.20249188
 ```
 
 The zero first-batch base-to-Student norm is expected for the existing
@@ -144,10 +164,10 @@ Student gradients. The auxiliary branches provide the initial Student signal.
 After `total_loss.backward()`:
 
 ```text
-Student tokenizer             gradient norm 0.20928845, finite
+Student tokenizer             gradient norm 0.15970043, finite
 DINO projector                gradient norm 0.02491881, finite
-TemporalFusionMLP             gradient norm 0.02793704, finite
-JEPA projector                gradient norm 0.02022957, finite
+TemporalFusionMLP             gradient norm 0.01941338, finite
+JEPA projector                gradient norm 0.01269354, finite
 DINO teacher                  0 trainable tensors, 0 gradient tensors, eval
 V-JEPA teacher                0 trainable tensors, 0 gradient tensors, eval
 ```
