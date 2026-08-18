@@ -1,0 +1,20 @@
+name: uva_libero10_dino_jepa_minimal_baseline
+
+defaults:
+  - uva_libero10_dino_jepa_minimal
+  - _self_
+
+model:
+  policy:
+    dual_teacher_params:
+      enable: false
+      enable_dino: false
+      enable_jepa: false
+
+logging:
+  name: train_uva_libero10_dino_jepa_minimal_baseline
+  tags:
+    - libero10
+    - small_student
+    - no_foundation_teacher
+    - baseline

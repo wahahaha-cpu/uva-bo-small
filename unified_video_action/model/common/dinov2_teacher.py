@@ -173,9 +173,8 @@ class DINOv2Teacher(nn.Module):
         )
 
     def train(self, mode: bool = True):
-        # ``policy.train()`` recursively reaches frozen teachers. Keep DINO in
-        # eval mode so its stochastic/dropout behavior cannot change by epoch.
-        super().train(mode)
+        # ``policy.train()`` recursively reaches frozen teachers.
+        super().train(False)
         self.model.eval()
         return self
 

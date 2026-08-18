@@ -1,5 +1,6 @@
 import torch
 import os
+from contextlib import contextmanager
 from typing import Dict, Tuple
 import torch.nn.functional as F
 import random
@@ -31,6 +32,32 @@ from unified_video_action.utils.language_model import (
 from unified_video_action.model.common.dinov2_teacher import DINOv2Teacher
 from unified_video_action.model.common.jepa_teacher import JEPATeacher
 from unified_video_action.model.common.student_tokenizer import StudentLatentTokenizer
+from unified_video_action.model.common.temporal_fusion import TemporalFusionMLP
+
+
+@contextmanager
+def _isolated_rng(seed=None, preserve_cuda: bool = False):
+    """Run initialization/teacher work without perturbing shared RNG state."""
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    torch_state = torch.random.get_rng_state()
+    cuda_states = None
+    # torch.manual_seed also seeds every CUDA device.  Save those states for
+    # seeded module initialization as well as for teacher/auxiliary forward.
+    if torch.cuda.is_available() and (seed is not None or preserve_cuda):
+        cuda_states = torch.cuda.get_rng_state_all()
+    try:
+        if seed is not None:
+            random.seed(seed)
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+        yield
+    finally:
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
+        torch.random.set_rng_state(torch_state)
+        if cuda_states is not None:
+            torch.cuda.set_rng_state_all(cuda_states)
 
 
 class UnifiedVideoActionPolicy(BaseImagePolicy):
@@ -109,6 +136,45 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
         ).lower()
         self._last_align_metrics = {}
 
+        self.dual_teacher_params = kwargs.get("dual_teacher_params", {})
+        self.use_dual_teacher_alignment = bool(
+            self.dual_teacher_params.get("enable", False)
+        )
+        self.enable_dino_spatial = self.use_dual_teacher_alignment and bool(
+            self.dual_teacher_params.get("enable_dino", True)
+        )
+        self.enable_jepa_dynamics = self.use_dual_teacher_alignment and bool(
+            self.dual_teacher_params.get("enable_jepa", True)
+        )
+        self.lambda_dino = float(
+            self.dual_teacher_params.get("lambda_dino", 0.02)
+        )
+        self.lambda_jepa = float(
+            self.dual_teacher_params.get("lambda_jepa", 0.05)
+        )
+        self.dual_projector_dim = int(
+            self.dual_teacher_params.get("projector_dim", 512)
+        )
+        self.dual_init_seed = int(
+            self.dual_teacher_params.get("init_seed", 4200)
+        )
+        self.dual_required_frames = int(
+            self.dual_teacher_params.get("required_frames", 4)
+        )
+        self.dino_loss_type = str(
+            self.dual_teacher_params.get("dino_loss_type", "hybrid")
+        ).lower()
+        self.dino_mse_coeff = float(
+            self.dual_teacher_params.get("dino_mse_coeff", 0.25)
+        )
+        self.dino_stats_coeff = float(
+            self.dual_teacher_params.get("dino_stats_coeff", 0.1)
+        )
+        self.log_dual_teacher_shapes = bool(
+            self.dual_teacher_params.get("log_shapes_once", True)
+        )
+        self._dual_teacher_shapes_logged = False
+
         if self.teacher_type not in ("vae", "jepa", "dinov2"):
             raise ValueError(
                 f"Unsupported teacher_type={self.teacher_type!r}. "
@@ -129,6 +195,22 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
             raise ValueError(
                 "This DINOv2 experiment requires align_on='token_feat'."
             )
+        if self.use_dual_teacher_alignment:
+            if not self.use_student_tokenizer:
+                raise ValueError(
+                    "dual_teacher_params.enable=True requires "
+                    "use_student_tokenizer=True."
+                )
+            if not (self.enable_dino_spatial or self.enable_jepa_dynamics):
+                raise ValueError(
+                    "Dual-teacher alignment must enable DINO, JEPA, or both."
+                )
+            if self.dual_required_frames != 4:
+                raise ValueError(
+                    "The minimal DINO+JEPA experiment requires exactly 4 frames."
+                )
+            if self.lambda_dino < 0.0 or self.lambda_jepa < 0.0:
+                raise ValueError("Teacher loss coefficients must be non-negative.")
 
         # Student alignment consumes RGB directly, but video generation and FVD
         # still encode/decode through the VAE even for JEPA/DINO teachers.
@@ -149,16 +231,34 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
         self.jepa_teacher = None
         self.teacher_feat_dim = None
         self.teacher_latent_projector = None
+        if self.use_dual_teacher_alignment:
+            with _isolated_rng():
+                if self.enable_jepa_dynamics:
+                    self.jepa_teacher = JEPATeacher(**self.jepa_teacher_params)
+                if self.enable_dino_spatial:
+                    self.dinov2_teacher = DINOv2Teacher(
+                        **self.dinov2_teacher_params
+                    )
+        else:
+            if self.teacher_type == "jepa":
+                self.jepa_teacher = JEPATeacher(**self.jepa_teacher_params)
+            if self.teacher_type == "dinov2":
+                self.dinov2_teacher = DINOv2Teacher(**self.dinov2_teacher_params)
         if self.teacher_type == "jepa":
-            self.jepa_teacher = JEPATeacher(**self.jepa_teacher_params)
             self.teacher_feat_dim = self.jepa_teacher.feat_dim
         elif self.teacher_type == "dinov2":
-            self.dinov2_teacher = DINOv2Teacher(**self.dinov2_teacher_params)
             self.teacher_feat_dim = self.dinov2_teacher.feat_dim
+        for teacher in (self.dinov2_teacher, self.jepa_teacher):
+            if teacher is not None:
+                teacher.eval()
+                teacher.requires_grad_(False)
 
         # =========================== student tokenizer ===========================
         self.student_tokenizer = None
         self.align_projector = None
+        self.student_to_dino_projector = None
+        self.temporal_fusion = None
+        self.student_to_jepa_projector = None
         if self.use_student_tokenizer:
             if self.student_tokenizer_params is None:
                 raise ValueError(
@@ -201,6 +301,33 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
                     torch.nn.SiLU(),
                     torch.nn.Linear(self.align_projector_dim, align_target_dim),
                 )
+
+            hidden_dim = int(self.student_tokenizer_params.get("hidden_dim", 384))
+            if self.enable_dino_spatial:
+                with _isolated_rng(self.dual_init_seed + 1):
+                    self.student_to_dino_projector = torch.nn.Sequential(
+                        torch.nn.Linear(hidden_dim, self.dual_projector_dim),
+                        torch.nn.SiLU(),
+                        torch.nn.Linear(
+                            self.dual_projector_dim, self.dual_projector_dim
+                        ),
+                        torch.nn.SiLU(),
+                        torch.nn.Linear(
+                            self.dual_projector_dim, self.dinov2_teacher.feat_dim
+                        ),
+                    )
+            if self.enable_jepa_dynamics:
+                with _isolated_rng(self.dual_init_seed + 2):
+                    self.temporal_fusion = TemporalFusionMLP(hidden_dim)
+                with _isolated_rng(self.dual_init_seed + 3):
+                    self.student_to_jepa_projector = torch.nn.Sequential(
+                        torch.nn.LayerNorm(hidden_dim),
+                        torch.nn.Linear(hidden_dim, self.dual_projector_dim),
+                        torch.nn.GELU(),
+                        torch.nn.Linear(
+                            self.dual_projector_dim, self.jepa_teacher.feat_dim
+                        ),
+                    )
 
         ## =========================== load language model ===========================
         self.text_model, self.tokenizer, self.max_length = get_text_model(
@@ -565,6 +692,15 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
                     self.teacher_latent_projector, weight_decay=weight_decay
                 )
             )
+        for module in (
+            self.student_to_dino_projector,
+            self.temporal_fusion,
+            self.student_to_jepa_projector,
+        ):
+            if module is not None:
+                optim_groups.extend(
+                    self.add_weight_decay(module, weight_decay=weight_decay)
+                )
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas)
 
         # Manually set 'initial_lr' for each parameter group (assuming a base learning rate)
@@ -603,66 +739,112 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
         return z.permute(0, 1, 3, 4, 2).reshape(bsz, timesteps, height * width, channels)
 
     @staticmethod
-    def _resample_teacher_tokens(
-        student_tokens: torch.Tensor, teacher_tokens: torch.Tensor
+    def _resample_spatial_tokens(
+        tokens: torch.Tensor, target_token_count: int
     ) -> torch.Tensor:
-        if student_tokens.shape[1:3] == teacher_tokens.shape[1:3]:
-            return teacher_tokens
+        """Interpolate only a token tensor's explicit H-W grid."""
+        if tokens.ndim not in (3, 4):
+            raise ValueError(
+                "Spatial token resampling expects [B,N,D] or [B,T,N,D], got "
+                f"{tuple(tokens.shape)}"
+            )
 
-        bsz, timesteps, student_token_count, _ = student_tokens.shape
-        if bsz != teacher_tokens.shape[0] or timesteps != teacher_tokens.shape[1]:
+        source_token_count = tokens.shape[-2]
+        if source_token_count == target_token_count:
+            return tokens
+
+        source_side = int(source_token_count**0.5)
+        target_side = int(target_token_count**0.5)
+        if source_side * source_side != source_token_count:
+            raise ValueError(
+                f"Source token count {source_token_count} is not a square grid."
+            )
+        if target_side * target_side != target_token_count:
+            raise ValueError(
+                f"Target token count {target_token_count} is not a square grid."
+            )
+
+        feature_dim = tokens.shape[-1]
+        if tokens.ndim == 4:
+            batch_size, timesteps = tokens.shape[:2]
+            token_map = tokens.reshape(
+                batch_size * timesteps,
+                source_side,
+                source_side,
+                feature_dim,
+            ).permute(0, 3, 1, 2)
+            token_map = F.interpolate(
+                token_map,
+                size=(target_side, target_side),
+                mode="bilinear",
+                align_corners=False,
+            )
+            return token_map.permute(0, 2, 3, 1).reshape(
+                batch_size, timesteps, target_token_count, feature_dim
+            )
+
+        batch_size = tokens.shape[0]
+        token_map = tokens.reshape(
+            batch_size, source_side, source_side, feature_dim
+        ).permute(0, 3, 1, 2)
+        token_map = F.interpolate(
+            token_map,
+            size=(target_side, target_side),
+            mode="bilinear",
+            align_corners=False,
+        )
+        return token_map.permute(0, 2, 3, 1).reshape(
+            batch_size, target_token_count, feature_dim
+        )
+
+    @classmethod
+    def _resample_teacher_tokens(
+        cls, student_tokens: torch.Tensor, teacher_tokens: torch.Tensor
+    ) -> torch.Tensor:
+        if student_tokens.ndim != 4 or teacher_tokens.ndim != 4:
+            raise ValueError("Legacy teacher alignment expects [B,T,N,D] tokens.")
+        if student_tokens.shape[:2] != teacher_tokens.shape[:2]:
             raise ValueError(
                 "Teacher/student batch or time mismatch: "
                 f"student={student_tokens.shape}, teacher={teacher_tokens.shape}"
             )
+        return cls._resample_spatial_tokens(
+            teacher_tokens, target_token_count=student_tokens.shape[2]
+        )
 
-        teacher_token_count = teacher_tokens.shape[2]
-        feat_dim = teacher_tokens.shape[3]
-        student_side = int(student_token_count**0.5)
-        teacher_side = int(teacher_token_count**0.5)
-        if student_side * student_side != student_token_count:
+    @staticmethod
+    def _expand_jepa_regions_for_legacy_alignment(
+        teacher_tokens: torch.Tensor,
+        target_timesteps: int,
+        tubelet_size: int,
+    ) -> torch.Tensor:
+        if teacher_tokens.shape[1] == target_timesteps:
+            return teacher_tokens
+        if teacher_tokens.shape[1] * tubelet_size != target_timesteps:
             raise ValueError(
-                f"Student token count {student_token_count} is not a square grid."
+                "Cannot map V-JEPA temporal regions to legacy frame alignment: "
+                f"teacher={tuple(teacher_tokens.shape)}, "
+                f"target_timesteps={target_timesteps}, tubelet_size={tubelet_size}"
             )
-        if teacher_side * teacher_side != teacher_token_count:
-            raise ValueError(
-                f"Teacher token count {teacher_token_count} is not a square grid."
-            )
-
-        teacher_map = teacher_tokens.reshape(
-            bsz, timesteps, teacher_side, teacher_side, feat_dim
-        )
-        teacher_map = teacher_map.permute(0, 1, 4, 2, 3).reshape(
-            bsz * timesteps, feat_dim, teacher_side, teacher_side
-        )
-        teacher_map = F.interpolate(
-            teacher_map,
-            size=(student_side, student_side),
-            mode="bilinear",
-            align_corners=False,
-        )
-        return teacher_map.reshape(
-            bsz, timesteps, feat_dim, student_side, student_side
-        ).permute(0, 1, 3, 4, 2).reshape(
-            bsz, timesteps, student_token_count, feat_dim
-        )
+        return teacher_tokens.repeat_interleave(tubelet_size, dim=1)
 
     def _encode_student_latent(self, x: torch.Tensor):
         latent, token_feat = self.student_tokenizer(x)
         return latent, token_feat
 
-    def _compute_alignment_loss(
-        self, student_tokens: torch.Tensor, teacher_tokens: torch.Tensor
+    @staticmethod
+    def _compute_feature_alignment_loss(
+        student_tokens: torch.Tensor,
+        teacher_tokens: torch.Tensor,
+        loss_type: str,
+        mse_coeff: float,
+        stats_coeff: float,
     ):
-        student_tokens_raw = student_tokens
-        if self.align_projector is not None:
-            student_tokens = self.align_projector(student_tokens)
-
-        assert student_tokens.shape == teacher_tokens.shape, (
-            student_tokens.shape,
-            teacher_tokens.shape,
-        )
-
+        if student_tokens.shape != teacher_tokens.shape:
+            raise ValueError(
+                "Student/teacher token shapes must match, got "
+                f"{tuple(student_tokens.shape)} and {tuple(teacher_tokens.shape)}"
+            )
         student_tokens = student_tokens.float()
         teacher_tokens = teacher_tokens.float()
 
@@ -673,35 +855,320 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
         cosine_loss = 1.0 - cosine
         mse_loss = F.mse_loss(student_tokens, teacher_tokens)
 
-        student_mu = student_tokens.mean(dim=(0, 1, 2))
-        teacher_mu = teacher_tokens.mean(dim=(0, 1, 2))
-        student_std = student_tokens.std(dim=(0, 1, 2)).clamp_min(eps)
-        teacher_std = teacher_tokens.std(dim=(0, 1, 2)).clamp_min(eps)
+        reduction_dims = tuple(range(student_tokens.ndim - 1))
+        student_mu = student_tokens.mean(dim=reduction_dims)
+        teacher_mu = teacher_tokens.mean(dim=reduction_dims)
+        # Keep the legacy alignment statistic (torch.std's unbiased estimate)
+        # unchanged while allowing the helper to serve both teacher branches.
+        student_std = student_tokens.std(dim=reduction_dims).clamp_min(eps)
+        teacher_std = teacher_tokens.std(dim=reduction_dims).clamp_min(eps)
         mean_loss = F.mse_loss(student_mu, teacher_mu)
         std_loss = F.mse_loss(student_std, teacher_std)
         stats_loss = mean_loss + std_loss
 
-        if self.align_loss_type == "mse":
+        if loss_type == "mse":
             base_loss = mse_loss
-        elif self.align_loss_type == "hybrid":
+        elif loss_type == "hybrid":
             base_loss = 0.5 * (cosine_loss + mse_loss)
         else:
             base_loss = cosine_loss
 
-        total_align_loss = (
-            base_loss + self.align_mse_coeff * mse_loss + self.align_stats_coeff * stats_loss
-        )
+        total_align_loss = base_loss + mse_coeff * mse_loss + stats_coeff * stats_loss
         metrics = {
-            "align_cos": cosine.detach(),
-            "align_mse": mse_loss.detach(),
-            "align_stats": stats_loss.detach(),
-            "student_norm": student_tokens_raw.detach().norm(dim=-1).mean(),
+            "cosine": cosine.detach(),
+            "mse": mse_loss.detach(),
+            "stats": stats_loss.detach(),
+            "student_norm": student_tokens.detach().norm(dim=-1).mean(),
             "teacher_norm": teacher_tokens.detach().norm(dim=-1).mean(),
         }
         return total_align_loss, metrics
 
+    def _compute_alignment_loss(
+        self, student_tokens: torch.Tensor, teacher_tokens: torch.Tensor
+    ):
+        student_tokens_raw = student_tokens
+        if self.align_projector is not None:
+            student_tokens = self.align_projector(student_tokens)
+        align_loss, metrics = self._compute_feature_alignment_loss(
+            student_tokens,
+            teacher_tokens,
+            loss_type=self.align_loss_type,
+            mse_coeff=self.align_mse_coeff,
+            stats_coeff=self.align_stats_coeff,
+        )
+        metrics = {
+            "align_cos": metrics["cosine"],
+            "align_mse": metrics["mse"],
+            "align_stats": metrics["stats"],
+            "student_norm": student_tokens_raw.detach().norm(dim=-1).mean(),
+            "teacher_norm": metrics["teacher_norm"],
+        }
+        return align_loss, metrics
+
+    def _compute_dino_spatial_alignment(
+        self, video: torch.Tensor, student_tokens: torch.Tensor
+    ):
+        with _isolated_rng(preserve_cuda=True):
+            teacher_tokens = self.dinov2_teacher.extract_tokens(video)
+        projected_student = self.student_to_dino_projector(student_tokens)
+        projected_student = self._resample_spatial_tokens(
+            projected_student, target_token_count=teacher_tokens.shape[2]
+        )
+        dino_loss, metrics = self._compute_feature_alignment_loss(
+            projected_student,
+            teacher_tokens,
+            loss_type=self.dino_loss_type,
+            mse_coeff=self.dino_mse_coeff,
+            stats_coeff=self.dino_stats_coeff,
+        )
+        return dino_loss, metrics, teacher_tokens, projected_student
+
+    def _compute_student_dynamics(self, student_tokens: torch.Tensor):
+        if student_tokens.ndim != 4:
+            raise ValueError(
+                f"Expected Student tokens [B,T,N,D], got {tuple(student_tokens.shape)}"
+            )
+        if student_tokens.shape[1] != self.dual_required_frames:
+            raise ValueError(
+                f"Expected {self.dual_required_frames} Student frames, got "
+                f"{student_tokens.shape[1]}"
+            )
+        s0, s1, s2, s3 = student_tokens.unbind(dim=1)
+        h01 = self.temporal_fusion(s0, s1)
+        h23 = self.temporal_fusion(s2, s3)
+        delta_student = h23 - h01
+        projected_delta_student = self.student_to_jepa_projector(delta_student)
+        return {
+            "s0": s0,
+            "s1": s1,
+            "s2": s2,
+            "s3": s3,
+            "h01": h01,
+            "h23": h23,
+            "delta_student": delta_student,
+            "projected_delta_student": projected_delta_student,
+        }
+
+    @torch.no_grad()
+    def _extract_jepa_dynamics_target(
+        self, video: torch.Tensor, return_metadata: bool = False
+    ):
+        with _isolated_rng(preserve_cuda=True):
+            teacher_result = self.jepa_teacher.extract_temporal_tokens(
+                video, return_metadata=return_metadata
+            )
+        if return_metadata:
+            teacher_tokens, metadata = teacher_result
+        else:
+            teacher_tokens = teacher_result
+            metadata = None
+        if teacher_tokens.shape[1] != 2:
+            raise RuntimeError(
+                "Four frames with tubelet_size=2 must produce two temporal "
+                f"regions, got {tuple(teacher_tokens.shape)}"
+            )
+        j01 = teacher_tokens[:, 0]
+        j23 = teacher_tokens[:, 1]
+        return j23 - j01, teacher_tokens, metadata
+
+    def _compute_jepa_dynamics_alignment(
+        self,
+        video: torch.Tensor,
+        student_tokens: torch.Tensor,
+        return_metadata: bool = False,
+    ):
+        delta_jepa, teacher_tokens, metadata = self._extract_jepa_dynamics_target(
+            video, return_metadata=return_metadata
+        )
+        dynamics = self._compute_student_dynamics(student_tokens)
+        projected_delta_student = self._resample_spatial_tokens(
+            dynamics["projected_delta_student"],
+            target_token_count=delta_jepa.shape[1],
+        )
+        dynamics["projected_delta_student"] = projected_delta_student
+
+        projected_float = projected_delta_student.float()
+        target_float = delta_jepa.float()
+        cosine = F.cosine_similarity(
+            projected_float, target_float, dim=-1, eps=1e-6
+        ).mean()
+        jepa_loss = 1.0 - cosine
+        metrics = {
+            "cosine": cosine.detach(),
+            "student_dynamics_norm": projected_float.detach().norm(dim=-1).mean(),
+            "teacher_dynamics_norm": target_float.detach().norm(dim=-1).mean(),
+        }
+        return jepa_loss, metrics, teacher_tokens, delta_jepa, dynamics, metadata
+
+    def _compute_dual_teacher_clip_losses(
+        self,
+        video: torch.Tensor,
+        student_tokens: torch.Tensor,
+        capture_shapes: bool = False,
+    ):
+        if video.shape[2] != self.dual_required_frames:
+            raise ValueError(
+                f"Dual-teacher clip must contain {self.dual_required_frames} frames, "
+                f"got {tuple(video.shape)}"
+            )
+        zero = student_tokens.new_zeros(())
+        dino_loss = zero
+        jepa_loss = zero
+        metrics = {}
+        shapes = {
+            "rgb": tuple(video.shape),
+            "student": tuple(student_tokens.shape),
+        }
+
+        if self.enable_dino_spatial:
+            (
+                dino_loss,
+                dino_metrics,
+                dino_tokens,
+                projected_dino,
+            ) = self._compute_dino_spatial_alignment(video, student_tokens)
+            metrics.update(
+                {
+                    "dino_cos": dino_metrics["cosine"],
+                    "dino_mse": dino_metrics["mse"],
+                    "dino_stats": dino_metrics["stats"],
+                    "dino_student_norm": dino_metrics["student_norm"],
+                    "dino_teacher_norm": dino_metrics["teacher_norm"],
+                }
+            )
+            if capture_shapes:
+                shapes["dino"] = tuple(dino_tokens.shape)
+                shapes["student_to_dino"] = tuple(projected_dino.shape)
+
+        if self.enable_jepa_dynamics:
+            (
+                jepa_loss,
+                jepa_metrics,
+                jepa_tokens,
+                delta_jepa,
+                dynamics,
+                jepa_metadata,
+            ) = self._compute_jepa_dynamics_alignment(
+                video, student_tokens, return_metadata=capture_shapes
+            )
+            metrics.update(
+                {
+                    "jepa_dynamics_cos": jepa_metrics["cosine"],
+                    "jepa_student_dynamics_norm": jepa_metrics[
+                        "student_dynamics_norm"
+                    ],
+                    "jepa_teacher_dynamics_norm": jepa_metrics[
+                        "teacher_dynamics_norm"
+                    ],
+                }
+            )
+            if capture_shapes:
+                shapes.update(
+                    {
+                        "jepa_input": jepa_metadata["input_shape"],
+                        "jepa_patch_embed": jepa_metadata["patch_embed_shape"],
+                        "raw_jepa": jepa_metadata["raw_output_shape"],
+                        "reshaped_jepa": tuple(jepa_tokens.shape),
+                        "j01": tuple(jepa_tokens[:, 0].shape),
+                        "j23": tuple(jepa_tokens[:, 1].shape),
+                        "delta_jepa": tuple(delta_jepa.shape),
+                        "s0": tuple(dynamics["s0"].shape),
+                        "s1": tuple(dynamics["s1"].shape),
+                        "s2": tuple(dynamics["s2"].shape),
+                        "s3": tuple(dynamics["s3"].shape),
+                        "h01": tuple(dynamics["h01"].shape),
+                        "h23": tuple(dynamics["h23"].shape),
+                        "delta_student": tuple(dynamics["delta_student"].shape),
+                        "projected_delta_student": tuple(
+                            dynamics["projected_delta_student"].shape
+                        ),
+                    }
+                )
+        return dino_loss, jepa_loss, metrics, shapes
+
+    def _compute_dual_teacher_pair_losses(
+        self,
+        conditioning_video: torch.Tensor,
+        conditioning_student: torch.Tensor,
+        target_video: torch.Tensor,
+        target_student: torch.Tensor,
+        capture_shapes: bool = False,
+    ):
+        """Compute both clips while preserving the base objective's RNG stream.
+
+        Teacher backbones and auxiliary projections are deterministic for a fixed
+        batch, but keeping the whole auxiliary scope isolated also protects the
+        action/diffusion sampling path from backend-specific CUDA RNG use.
+        """
+        with _isolated_rng(preserve_cuda=True):
+            dino_c, jepa_c, metrics_c, shapes = self._compute_dual_teacher_clip_losses(
+                conditioning_video,
+                conditioning_student,
+                capture_shapes=capture_shapes,
+            )
+            dino_z, jepa_z, metrics_z, _ = self._compute_dual_teacher_clip_losses(
+                target_video,
+                target_student,
+                capture_shapes=False,
+            )
+        dino_loss = 0.5 * (dino_c + dino_z)
+        jepa_loss = 0.5 * (jepa_c + jepa_z)
+        metrics = {
+            key: 0.5 * (metrics_c[key] + metrics_z[key])
+            for key in metrics_c
+        }
+        return dino_loss, jepa_loss, metrics, shapes
+
+    def _log_dual_teacher_first_forward(
+        self,
+        shapes: Dict[str, tuple],
+        base_loss: torch.Tensor,
+        dino_loss: torch.Tensor,
+        jepa_loss: torch.Tensor,
+        total_loss: torch.Tensor,
+    ) -> None:
+        if self._dual_teacher_shapes_logged:
+            return
+        self._dual_teacher_shapes_logged = True
+        if not self.log_dual_teacher_shapes or os.environ.get("RANK", "0") != "0":
+            return
+
+        print("--- foundation-teacher first-forward shapes ---", flush=True)
+        for label in (
+            "rgb",
+            "student",
+            "dino",
+            "student_to_dino",
+            "jepa_input",
+            "jepa_patch_embed",
+            "raw_jepa",
+            "reshaped_jepa",
+            "j01",
+            "j23",
+            "delta_jepa",
+            "s0",
+            "s1",
+            "s2",
+            "s3",
+            "h01",
+            "h23",
+            "delta_student",
+            "projected_delta_student",
+        ):
+            if label in shapes:
+                print(f"{label}: {shapes[label]}", flush=True)
+        print(
+            "losses: "
+            f"base={base_loss.detach().float().item():.6f}, "
+            f"dino={dino_loss.detach().float().item():.6f}, "
+            f"jepa={jepa_loss.detach().float().item():.6f}, "
+            f"total={total_loss.detach().float().item():.6f}",
+            flush=True,
+        )
+
     def compute_loss(self, batch, **kwargs):
         B, T, C, H, W = batch["obs"]["image"].size()
+        self._last_align_metrics = {}
 
         text_latents = None
         if self.language_emb_model == "clip":
@@ -739,7 +1206,12 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
         x, proprioception_input, _ = process_data(
             batch, task_name=self.task_name, **self.kwargs
         )
-        align_loss = torch.tensor(0.0, device=x.device)
+        align_loss = x.new_zeros(())
+        dino_loss = x.new_zeros(())
+        jepa_loss = x.new_zeros(())
+        legacy_metrics = {}
+        dual_metrics = {}
+        dual_shapes = {}
         if self.use_student_tokenizer and self.student_tokenizer is not None:
             c_img, x_img = torch.chunk(x, 2, dim=2)
             z, z_token_feat = self._encode_student_latent(x_img)
@@ -766,6 +1238,21 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
                     )
                     teacher_z_tokens = teacher.extract_tokens(x_img)
                     teacher_c_tokens = teacher.extract_tokens(c_img)
+                    if self.teacher_type == "jepa":
+                        teacher_z_tokens = (
+                            self._expand_jepa_regions_for_legacy_alignment(
+                                teacher_z_tokens,
+                                target_timesteps=x_img.shape[2],
+                                tubelet_size=self.jepa_teacher.tubelet_size,
+                            )
+                        )
+                        teacher_c_tokens = (
+                            self._expand_jepa_regions_for_legacy_alignment(
+                                teacher_c_tokens,
+                                target_timesteps=c_img.shape[2],
+                                tubelet_size=self.jepa_teacher.tubelet_size,
+                            )
+                        )
                     if self.align_on == "latent":
                         student_z_tokens = self._latent_to_tokens(z)
                         student_c_tokens = self._latent_to_tokens(c)
@@ -798,7 +1285,7 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
                     student_c_tokens, teacher_c_tokens
                 )
                 align_loss = 0.5 * (align_z + align_c)
-                self._last_align_metrics = {
+                legacy_metrics = {
                     "align_loss": align_loss.detach(),
                     "align_cos": 0.5 * (metrics_z["align_cos"] + metrics_c["align_cos"]),
                     "align_mse": 0.5 * (metrics_z["align_mse"] + metrics_c["align_mse"]),
@@ -809,6 +1296,21 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
                     "teacher_norm": 0.5
                     * (metrics_z["teacher_norm"] + metrics_c["teacher_norm"]),
                 }
+
+            if self.use_dual_teacher_alignment:
+                capture_shapes = not self._dual_teacher_shapes_logged
+                (
+                    dino_loss,
+                    jepa_loss,
+                    dual_metrics,
+                    dual_shapes,
+                ) = self._compute_dual_teacher_pair_losses(
+                    c_img,
+                    c_token_feat,
+                    x_img,
+                    z_token_feat,
+                    capture_shapes=capture_shapes,
+                )
         else:
             x, z, c, _, proprioception_input = get_vae_latent(
                 x, self.vae_model, eval=False, proprioception_input=proprioception_input
@@ -819,7 +1321,7 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
 
         selected_mode = random.choice(self.task_modes)
 
-        loss, video_loss, act_loss = self.model(
+        base_loss, video_loss, act_loss = self.model(
             z,
             c,
             history_trajectory,
@@ -828,8 +1330,35 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
             task_mode=selected_mode,
             proprioception_input=proprioception_input,
         )
+        loss = base_loss
         if self.use_student_tokenizer and self.use_alignment:
             loss = loss + self.align_coeff * align_loss
+        if self.use_dual_teacher_alignment:
+            loss = (
+                loss
+                + self.lambda_dino * dino_loss
+                + self.lambda_jepa * jepa_loss
+            )
+
+        total_loss_without_unused_terms = loss
+        self._last_align_metrics = {
+            **legacy_metrics,
+            **dual_metrics,
+            "base_loss": base_loss.detach(),
+            "dino_loss": dino_loss.detach(),
+            "jepa_loss": jepa_loss.detach(),
+            "weighted_dino_loss": (self.lambda_dino * dino_loss).detach(),
+            "weighted_jepa_loss": (self.lambda_jepa * jepa_loss).detach(),
+            "total_loss": total_loss_without_unused_terms.detach(),
+        }
+        if self.use_dual_teacher_alignment:
+            self._log_dual_teacher_first_forward(
+                dual_shapes,
+                base_loss,
+                dino_loss,
+                jepa_loss,
+                total_loss_without_unused_terms,
+            )
 
         # DDP safety: always attach every trainable parameter to graph.
         # Checking `param.grad is None` inside forward is unstable across iterations.
@@ -855,6 +1384,27 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
                 if param.requires_grad:
                     loss = loss + _ddp_unused_term(param)
 
+        for module in (
+            self.student_to_dino_projector,
+            self.temporal_fusion,
+            self.student_to_jepa_projector,
+        ):
+            if module is not None:
+                for param in module.parameters():
+                    if param.requires_grad:
+                        loss = loss + _ddp_unused_term(param)
+
+        if kwargs.get("return_debug_components", False):
+            components = {
+                "base_loss": base_loss,
+                "legacy_align_loss": align_loss,
+                "dino_loss": dino_loss,
+                "jepa_loss": jepa_loss,
+                "weighted_dino_loss": self.lambda_dino * dino_loss,
+                "weighted_jepa_loss": self.lambda_jepa * jepa_loss,
+                "total_loss": total_loss_without_unused_terms,
+            }
+            return loss, (video_loss, act_loss), components
         return loss, (video_loss, act_loss)
 
     def forward(self, batch, **kwargs):

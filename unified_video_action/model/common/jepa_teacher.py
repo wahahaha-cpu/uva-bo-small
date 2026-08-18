@@ -1,6 +1,7 @@
 import os
+import socket
 import time
-from typing import Optional
+from typing import Dict, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -35,6 +36,41 @@ def _find_cached_hub_repo(hub_dir: str, repo: str) -> Optional[str]:
     return None
 
 
+def _read_lock_metadata(lock_path: str) -> Dict[str, str]:
+    try:
+        with open(lock_path, "r", encoding="utf-8") as lock_file:
+            lines = lock_file.read().splitlines()
+    except (FileNotFoundError, OSError):
+        return {}
+
+    metadata = {}
+    for line in lines:
+        key, separator, value = line.partition("=")
+        if separator:
+            metadata[key.strip()] = value.strip()
+    return metadata
+
+
+def _lock_is_stale(lock_path: str, stale_after_s: int) -> bool:
+    try:
+        age_s = time.time() - os.path.getmtime(lock_path)
+    except FileNotFoundError:
+        return False
+
+    metadata = _read_lock_metadata(lock_path)
+    owner_host = metadata.get("host")
+    owner_pid = metadata.get("pid")
+    if owner_pid and (owner_host is None or owner_host == socket.gethostname()):
+        try:
+            os.kill(int(owner_pid), 0)
+        except (ProcessLookupError, ValueError):
+            return True
+        except PermissionError:
+            return False
+        return False
+    return age_s > stale_after_s
+
+
 def _resolve_checkpoint_path(checkpoint_path: Optional[str]) -> str:
     if checkpoint_path is None or str(checkpoint_path).strip() == "":
         raise FileNotFoundError(
@@ -59,7 +95,10 @@ def _torch_hub_load_locked(
     while time.time() < deadline:
         try:
             fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.close(fd)
+            with os.fdopen(fd, "w", encoding="utf-8") as lock_file:
+                lock_file.write(
+                    f"pid={os.getpid()}\nhost={socket.gethostname()}\n"
+                )
             try:
                 cached_repo = _find_cached_hub_repo(hub_dir, repo)
                 if cached_repo is not None:
@@ -76,6 +115,12 @@ def _torch_hub_load_locked(
                 except FileNotFoundError:
                     pass
         except FileExistsError:
+            if _lock_is_stale(lock_path, stale_after_s=timeout_s):
+                try:
+                    os.remove(lock_path)
+                except FileNotFoundError:
+                    pass
+                continue
             time.sleep(1.0)
 
     raise TimeoutError(
@@ -125,7 +170,7 @@ def _load_vjepa2_encoder_from_checkpoint(
 
 
 class JEPATeacher(nn.Module):
-    """Frozen V-JEPA 2.1 encoder used only for latent alignment."""
+    """Frozen V-JEPA 2.1 encoder with explicit temporal token structure."""
 
     def __init__(
         self,
@@ -170,6 +215,14 @@ class JEPATeacher(nn.Module):
 
         self.feat_dim = int(getattr(self.encoder, "embed_dim", default_feat_dim))
         self.patch_size = int(getattr(self.encoder, "patch_size", 16))
+        encoder_tubelet_size = int(
+            getattr(self.encoder, "tubelet_size", self.tubelet_size)
+        )
+        if encoder_tubelet_size != self.tubelet_size:
+            raise RuntimeError(
+                "Configured/loaded V-JEPA tubelet sizes disagree: "
+                f"configured={self.tubelet_size}, encoder={encoder_tubelet_size}"
+            )
         self.grid_size = self.img_size // self.patch_size
         self.num_spatial_tokens = self.grid_size * self.grid_size
 
@@ -179,6 +232,11 @@ class JEPATeacher(nn.Module):
         self.register_buffer(
             "std", torch.tensor(IMAGENET_STD).view(1, 3, 1, 1, 1), persistent=False
         )
+
+    def train(self, mode: bool = True):
+        super().train(False)
+        self.encoder.eval()
+        return self
 
     def _resize_video(self, x: torch.Tensor) -> torch.Tensor:
         bsz, channels, timesteps, height, width = x.shape
@@ -193,41 +251,91 @@ class JEPATeacher(nn.Module):
             0, 2, 1, 3, 4
         )
 
-    @staticmethod
-    def _resample_tokens(tokens: torch.Tensor, target_tokens: int) -> torch.Tensor:
-        batch_size, num_tokens, feat_dim = tokens.shape
-        side = int(num_tokens**0.5)
-        target_side = int(target_tokens**0.5)
-        if side * side != num_tokens or target_side * target_side != target_tokens:
+    @torch.no_grad()
+    def extract_temporal_tokens(
+        self, x: torch.Tensor, return_metadata: bool = False
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, object]]]:
+        if x.ndim != 5:
+            raise ValueError(f"Expected [B,C,T,H,W], got {tuple(x.shape)}")
+        if x.shape[1] != 3:
+            raise ValueError(f"V-JEPA expects 3 channels, got {x.shape[1]}")
+        if x.shape[2] % self.tubelet_size != 0:
             raise ValueError(
-                f"Token grids must be square, got {num_tokens} and {target_tokens}."
+                f"Frame count {x.shape[2]} must be divisible by tubelet_size="
+                f"{self.tubelet_size}."
             )
 
-        token_map = tokens.transpose(1, 2).reshape(batch_size, feat_dim, side, side)
-        token_map = F.interpolate(
-            token_map,
-            size=(target_side, target_side),
-            mode="bilinear",
-            align_corners=False,
-        )
-        return token_map.flatten(2).transpose(1, 2)
-
-    @torch.no_grad()
-    def extract_tokens(self, x: torch.Tensor) -> torch.Tensor:
         x = self._resize_video(x.float())
-        # process_data supplies policy images in [-1, 1], while V-JEPA 2.1 was
-        # trained with ImageNet normalization applied to RGB values in [0, 1].
         x = (x + 1.0) * 0.5
         x = (x - self.mean) / self.std
-        bsz, channels, timesteps, _, _ = x.shape
+        preprocessed_shape = tuple(x.shape)
 
-        # Encode every frame as a two-frame clip, matching the model tubelet size.
-        frames = x.permute(0, 2, 1, 3, 4).reshape(
-            bsz * timesteps, channels, self.img_size, self.img_size
+        patch_projection = getattr(
+            getattr(self.encoder, "patch_embed", None), "proj", None
         )
-        clips = torch.stack([frames, frames], dim=2)
-        tokens = self.encoder(clips)
-        if tokens.shape[1] != self.num_spatial_tokens:
-            tokens = self._resample_tokens(tokens, self.num_spatial_tokens)
+        if patch_projection is None:
+            raise RuntimeError("V-JEPA encoder does not expose patch_embed.proj")
 
-        return tokens.reshape(bsz, timesteps, tokens.shape[1], tokens.shape[2])
+        patch_embed_shape = {}
+
+        def _capture_patch_shape(_module, _inputs, output):
+            patch_embed_shape["shape"] = tuple(output.shape)
+
+        hook = patch_projection.register_forward_hook(_capture_patch_shape)
+        try:
+            raw_tokens = self.encoder(x)
+        finally:
+            hook.remove()
+
+        if not torch.is_tensor(raw_tokens) or raw_tokens.ndim != 3:
+            raise RuntimeError(
+                "Unexpected V-JEPA encoder output: "
+                f"{type(raw_tokens)} "
+                f"{getattr(raw_tokens, 'shape', None)}"
+            )
+        if "shape" not in patch_embed_shape:
+            raise RuntimeError("V-JEPA patch projection hook did not run")
+
+        patch_shape = patch_embed_shape["shape"]
+        if len(patch_shape) != 5:
+            raise RuntimeError(
+                f"Expected Conv3d patch output [B,D,T,H,W], got {patch_shape}"
+            )
+        batch_size, feature_dim, temporal_tokens, grid_h, grid_w = patch_shape
+        expected_token_count = temporal_tokens * grid_h * grid_w
+        if raw_tokens.shape != (
+            batch_size,
+            expected_token_count,
+            feature_dim,
+        ):
+            raise RuntimeError(
+                "V-JEPA token/patch shapes disagree: "
+                f"patch_embed={patch_shape}, encoder={tuple(raw_tokens.shape)}"
+            )
+
+        # Conv3d returns [B,D,T,H,W], and PatchEmbed3D uses flatten(2), so the
+        # encoder sequence is explicitly ordered as temporal, height, width.
+        tokens = raw_tokens.reshape(
+            batch_size,
+            temporal_tokens,
+            grid_h * grid_w,
+            feature_dim,
+        )
+        metadata = {
+            "input_shape": preprocessed_shape,
+            "patch_embed_shape": patch_shape,
+            "raw_output_shape": tuple(raw_tokens.shape),
+            "temporal_tokens": temporal_tokens,
+            "spatial_grid": (grid_h, grid_w),
+            "reshaped_output_shape": tuple(tokens.shape),
+            "flatten_order": "temporal,height,width",
+        }
+        if return_metadata:
+            return tokens, metadata
+        return tokens
+
+    @torch.no_grad()
+    def extract_tokens(
+        self, x: torch.Tensor, return_metadata: bool = False
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, object]]]:
+        return self.extract_temporal_tokens(x, return_metadata=return_metadata)

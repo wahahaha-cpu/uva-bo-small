@@ -1,0 +1,56 @@
+# Minimal complementary-teacher experiment: DINO spatial semantics plus
+# V-JEPA temporal-region dynamics, both auxiliary to the existing UVA loss.
+name: uva_libero10_dino_jepa_minimal
+
+defaults:
+  - uva_libero10_student
+  - override /model/student_tokenizer: small
+  - _self_
+
+model:
+  policy:
+    # Disable the legacy single-teacher/VAE imitation path for this ablation.
+    teacher_type: vae
+    align_params:
+      enable: false
+    dinov2_teacher_params:
+      model_name: dinov2_vits14
+      img_size: 224
+      model_img_size: 518
+      checkpoint_path: pretrained_models/dinov2/dinov2_vits14_pretrain.pth
+      loader: timm
+    jepa_teacher_params:
+      model_name: vjepa2_1_vit_base_384
+      img_size: 384
+      tubelet_size: 2
+      checkpoint_path: pretrained_models/jepa/vjepa2_1_vitb_dist_vitG_384.pt
+      checkpoint_key: ema_encoder
+      loader: checkpoint
+    dual_teacher_params:
+      enable: true
+      enable_dino: true
+      enable_jepa: true
+      # The hybrid DINO objective has a larger raw loss scale, so keep its
+      # auxiliary coefficient conservative relative to cosine-only JEPA.
+      lambda_dino: 0.02
+      lambda_jepa: 0.05
+      projector_dim: 512
+      init_seed: 4200
+      required_frames: 4
+      dino_loss_type: hybrid
+      dino_mse_coeff: 0.25
+      dino_stats_coeff: 0.1
+      log_shapes_once: true
+
+training:
+  resume: false
+
+logging:
+  project: uva-dino-jepa-minimal
+  name: train_uva_libero10_dino_jepa_minimal
+  tags:
+    - libero10
+    - small_student
+    - dino_spatial
+    - jepa_temporal_dynamics
+    - complementary_teachers

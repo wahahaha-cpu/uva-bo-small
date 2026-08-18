@@ -1,0 +1,19 @@
+name: uva_libero10_dino_jepa_minimal_jepa_only
+
+defaults:
+  - uva_libero10_dino_jepa_minimal
+  - _self_
+
+model:
+  policy:
+    dual_teacher_params:
+      enable_dino: false
+      enable_jepa: true
+
+logging:
+  name: train_uva_libero10_dino_jepa_minimal_jepa_only
+  tags:
+    - libero10
+    - small_student
+    - jepa_temporal_dynamics
+    - jepa_only
