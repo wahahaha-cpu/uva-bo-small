@@ -10,6 +10,7 @@
 | V2 | `jepa2_1_token_feat_alignment` | `323ba5c` | student 最终 encoder `token_feat` 通过现有 `align_projector` 投影到 768 维，单方面对齐原始 JEPA token | 已完成 |
 | V3 | `jepa2_1_token_feat_frozen_mar` | `2ef6f4f` | 保持 V2 token-feature 对齐，冻结 MAR blocks/heads，只训练 position embedding 与 fake/blank token 接口参数 | 已完成并保留 |
 | V4 | `jepa2_1_token_feat_fully_frozen_mar` | 本分支 HEAD | 保持 V2 token-feature 对齐，严格冻结全部 MAR 参数，只训练 student 与 align projector | 已完成 |
+| V5 | `jepa2_1_token_feat_fully_frozen_mar` 工作区 | 待提交 | 对标 V2 不冻结实验，加载相同 video checkpoint 并使用 `conv_fc`；冻结 MAR 主干，只重开随机初始化的 action head | 故障已定位，修复后重启 |
 
 ### 0.1 版本保存约定
 
@@ -18,6 +19,7 @@
 3. V2 是在 V1 基础上新增模式，不修改或删除 V1 的 `align_on: latent` 行为。
 4. V3 在 V2 基础上只改变 MAR 参数的可训练范围，不改变 JEPA 对齐、loss、数据或推理结构。
 5. V4 保留 V3 配置和脚本作为对照，新增严格全冻结配置；不覆盖任何旧实验入口。
+6. V5 使用独立配置和脚本，不覆盖 V2/V3/V4；它与 V2 的主要对照变量是 MAR 主干是否训练，video checkpoint、`conv_fc` action head、JEPA token-feature 对齐和 global batch 保持一致。
 
 ## 1. V1 初始移植任务范围
 
@@ -1829,3 +1831,335 @@ git show --stat --oneline HEAD
 ```
 
 V4 分支：`jepa2_1_token_feat_fully_frozen_mar`。用户明确要求前不推送远端。
+
+## 17. V5：冻结 video-pretrained MAR 主干，只训练 `conv_fc` action head
+
+### 17.1 实验问题与严格对照
+
+V5 对标的是 V2 的“不冻结 JEPA token-feature”实验，不是加载
+`checkpoints/libero10.ckpt` 的 fully-frozen pretrained-action 实验。两者的共同设置为：
+
+| 项目 | V2 不冻结基线 | V5 本实验 |
+|---|---|---|
+| teacher | V-JEPA 2.1 ViT-Base/384，冻结 | 相同 |
+| 对齐对象 | student 最终 `token_feat` | 相同 |
+| projector | `304 -> 512 -> 512 -> 768` | 相同 |
+| alignment loss | `coeff=0.05`、hybrid | 相同 |
+| MAR 初始化 | `checkpoints/libero10_video.ckpt` | 相同 |
+| video checkpoint action head | 不存在 | 不存在 |
+| action head | 随机初始化 `conv_fc` | 相同 |
+| action head 训练 | 是 | 是 |
+| MAR 主干训练 | 是 | 否 |
+| position/fake 参数训练 | 是 | 否 |
+| 训练模式 | `policy_model` | 相同 |
+| optimizer | AdamW，LR `1e-4` | 相同 |
+| effective global batch | 128 | 相同 |
+
+因此本文中的“冻结 MAR”精确含义是：
+
+```text
+MAR 内除 model.diffactloss.* 外全部冻结
+```
+
+`diffactloss` 包含完整 action conditioning adapter 和共享 action diffusion MLP，
+不是只解冻 adapter 的一部分。
+
+### 17.2 参数白名单实现
+
+文件：`unified_video_action/policy/unified_video_action_policy.py`。
+
+新增配置字段：
+
+```python
+self.keep_mar_action_head_trainable = bool(
+    kwargs.get("keep_mar_action_head_trainable", False)
+)
+```
+
+约束为：
+
+```text
+keep_mar_action_head_trainable=true
+  -> 必须 freeze_mar=true
+  -> 必须 action_model_params.predict_action=true
+```
+
+动作头参数只按完整模块前缀匹配：
+
+```python
+name == "diffactloss" or name.startswith("diffactloss.")
+```
+
+冻结顺序为：
+
+```text
+构建 MAR 与随机 conv_fc action head
+  -> 从 checkpoints/libero10_video.ckpt 加载名称和 shape 匹配的 MAR 权重
+  -> self.model.requires_grad_(False)
+  -> 仅将 diffactloss.* 重新设为 requires_grad=True
+```
+
+`keep_mar_pos_and_fake_trainable=false`，所以 V3 的 position/fake 白名单不会被重开。
+配置若要求重开 action head、但真实模型中没有匹配参数，会立即抛出
+`RuntimeError`，避免静默得到全冻结模型。
+
+optimizer 原有 `requires_grad` 过滤无需修改：
+
+```text
+进入 AdamW:
+  student tokenizer
+  align_projector
+  model.diffactloss.*
+
+不进入 AdamW:
+  MAR encoder/decoder/video head
+  MAR input/condition projections
+  position embedding 与 fake/null token
+  frozen V-JEPA teacher
+```
+
+普通 MAR forward 没有包 `torch.no_grad()`，所以 action loss 仍可穿过冻结主干返回
+student；`diffactloss` 本身同时接收并更新 action loss 梯度。
+
+### 17.3 VAE 初始化边界
+
+student tokenizer 的 JEPA/DINO 对齐训练直接消费 RGB，不依赖 VAE；但只要
+`autoregressive_model_params.predict_video=true`，视频生成和 epoch-end FVD 仍需要
+VAE 编码/解码。因此当前 policy 仅在 student 对齐且不预测视频时跳过 VAE；V5 的
+`predict_video=true` 配置会构建并冻结 VAE。legacy VAE teacher 或非 student 配置也
+继续按原逻辑构建 VAE。这样保留 action-only 配置的显存优化，同时不破坏视频评估。
+
+### 17.4 新增配置
+
+文件：
+`unified_video_action/config/uva_libero10_jepa2_1_small_token_feat_frozen_mar_trainable_action_head.yaml`。
+
+核心覆盖：
+
+```yaml
+defaults:
+  - uva_libero10_jepa2_1_small_token_feat
+
+model:
+  policy:
+    freeze_mar: true
+    keep_mar_pos_and_fake_trainable: false
+    keep_mar_action_head_trainable: true
+    autoregressive_model_params:
+      pretrained_model_path: checkpoints/libero10_video.ckpt
+    action_model_params:
+      predict_action: true
+      act_model_type: conv_fc
+    selected_training_mode: policy_model
+
+training:
+  lr_warmup_steps: 2000
+  resume: false
+```
+
+配置直接继承 V2 token-feature baseline，未复制或改变 JEPA/student/alignment loss
+参数。`resume=false` 防止误接 fully-frozen、pretrained-action 或旧 scheduler 状态。
+
+### 17.5 新增八卡脚本
+
+文件：
+`scripts/training/train_uva_libero10_jepa2_1_small_token_feat_frozen_mar_trainable_action_head_8gpu.sh`。
+
+默认布局：
+
+```text
+GPU_IDS=0,1,2,3,4,5,6,7
+NUM_PROCESSES=8
+PER_DEVICE_BATCH=16
+GRAD_ACCUM_STEPS=1
+effective global batch=128
+LR_WARMUP_STEPS=2000 optimizer updates
+```
+
+脚本在启动前检查 GPU 数量、global batch、数据、JEPA/VAE/video 权重和 Python/
+Accelerate 路径。video checkpoint 预检要求：
+
+```text
+predict_video=true
+predict_action=false
+model.diffactloss.* key count=0
+```
+
+这保证实验不会误加载 `checkpoints/libero10.ckpt` 的 pretrained action head；
+`conv_fc` action head 必须随机初始化并由当前训练学习。
+
+### 17.6 四卡/八卡尺度等价性
+
+V5 直接使用第 3 节所述已修复 workspace。对照布局为：
+
+```text
+4 GPU x batch 8  x accumulation 4 = global batch 128
+8 GPU x batch 16 x accumulation 1 = global batch 128
+```
+
+两者都是每 epoch 971 次 optimizer update，loss 按 accumulation window 平均，
+scheduler/EMA/global_step 只在成功 optimizer update 时推进。V5 没有新增或绕过另一套
+梯度累积逻辑。
+
+### 17.7 启动前实测
+
+以下检查已实际执行并通过：
+
+1. 新脚本 `bash -n`：PASS。
+2. policy 与梯度脚本 Python 3.9 `py_compile`：PASS。
+3. Hydra 完整合成：`teacher_type=jepa`、`align_on=token_feat`、video checkpoint、
+   `conv_fc`、`freeze_mar=true`、position/fake false、action-head true。
+4. video checkpoint 预检：`predict_video=true`、`predict_action=false`、action head
+   key 数为 0。
+5. 脚本 dry-run：8 进程、batch 16、accumulation 1、global batch 128、warmup
+   2000、resume false 和独立 run directory。
+6. CPU 白名单反向测试：只有 `diffactloss.*` 收到 MAR 内部梯度并更新；冻结主干
+   `.grad is None`；student 收到 action loss 梯度；projector 不接收 action-only loss。
+7. 4/8 卡尺度 oracle：直接 global gradient 最大误差 `2.776e-17`，6 次 update 后
+   参数最大误差 `2.711e-20`，LR 轨迹最大误差 `0.000e+00`。
+8. `git diff --check`：PASS。
+
+核心验证输出：
+
+```text
+Video checkpoint preflight: PASS
+Action-head-only optimizer/update checks: PASS
+Gradient/LR equivalence: PASS
+4 x 8 x accum-4 == 8 x 16 x accum-1 == global batch 128
+```
+
+### 17.8 启动方式与运行记录
+
+直接启动：
+
+```bash
+cd /home/jinboning/project/uva-bo-small
+bash scripts/training/train_uva_libero10_jepa2_1_small_token_feat_frozen_mar_trainable_action_head_8gpu.sh
+```
+
+首次启动（已失败，目录保留用于诊断）：
+
+```text
+tmux session: uva_jepa_tk_frozen_mar_action_8gpu
+run directory: checkpoints/uva_libero10_jepa2_1_small_token_feat_frozen_mar_trainable_action_head_8gpu_20260809_235136
+launch log: checkpoints/uva_libero10_jepa2_1_small_token_feat_frozen_mar_trainable_action_head_8gpu_20260809_235136.launch.log
+W&B local run: wandb/run-20260809_235346-50qgwlwo
+layout: 8 GPU x batch 16 x accumulation 1 = global batch 128
+```
+
+运行时 scheduler 打印为：
+
+```text
+batches_before_prepare=7761
+local_batches_per_epoch=971
+accumulation_steps=1
+updates_per_epoch=971
+warmup_updates=2000
+total_updates=2961550
+```
+
+首次启动曾跑到 epoch 0 的 `132/971` optimizer update，约 `1.48 update/s`；随后
+在 epoch-end FVD 阶段失败。训练前向、反向、NCCL 和显存均正常。GPU 1 启动前已有
+另一用户服务占用约 31.6 GB，本训练与其共存时总占用约 65.1/85.7 GB，未停止或修改
+该进程。
+
+修复后使用全新目录重新启动：
+
+```text
+tmux session: uva_jepa_tk_frozen_mar_action_8gpu_fix
+run directory: checkpoints/uva_libero10_jepa2_1_small_token_feat_frozen_mar_trainable_action_head_8gpu_20260810_152542
+launch log: checkpoints/uva_libero10_jepa2_1_small_token_feat_frozen_mar_trainable_action_head_8gpu_20260810_152542.launch.log
+layout: 8 GPU x batch 16 x accumulation 1 = global batch 128
+```
+
+该 run 已完成 epoch 0 的 `971/971` 次 optimizer update，用时约 12 分 21 秒，稳定
+吞吐约为 `1.3-1.5 update/s`。随后八个 rank 均进入 `test_video_fvd 0 19`，VAE 成功
+完成真实帧编码和预测 latent 解码，并实际写出 8 帧的 `real_0`、`predicted_0`
+MP4/GIF；未再出现 `None.encode`。FVD 后训练继续进入 Libero rollout 评估。
+
+本机 tmux 会被当前 Conda `libtinfo` 干扰，查看时需要移除继承的
+`LD_LIBRARY_PATH`：
+
+```bash
+env -u LD_LIBRARY_PATH /usr/bin/tmux attach -t uva_jepa_tk_frozen_mar_action_8gpu_fix
+
+# 不进入 tmux，直接查看持续日志：
+tail -f checkpoints/uva_libero10_jepa2_1_small_token_feat_frozen_mar_trainable_action_head_8gpu_20260810_152542.launch.log
+```
+
+### 17.9 故障根因与修复记录
+
+首次 run 在 `2026-08-10 00:06:27` 退出，rank 0 的根因是：
+
+```text
+AttributeError: 'NoneType' object has no attribute 'encode'
+  eval.py: prepare_data_predict_action()
+  data_utils.py: get_vae_latent()
+  model.vae_model is None
+```
+
+训练阶段使用 student tokenizer 和 JEPA token-feature 对齐，不会访问该 VAE，所以
+前 132 个 optimizer update 正常；epoch 结束的 `test_video_fvd()` 需要 VAE 对真实视频
+做 latent 编码、对采样 token 做解码，才触发错误。该 run 在 FVD/保存阶段前退出，目录
+中没有可用 checkpoint，不能从它 resume。
+
+修复位于 `unified_video_action/policy/unified_video_action_policy.py`：
+
+```python
+requires_vae = (
+    not use_student_tokenizer
+    or teacher_type == "vae"
+    or predict_video
+)
+```
+
+并增加了 VAE 初始化契约测试和完整 policy preflight：V5 实际 resolved config 下
+`vae_model=AutoencoderKL`、VAE 参数全部冻结、MAR 可训练 tensor 数为 72 且全部以
+`diffactloss.` 开头。
+
+`AutoencoderKL` 是仓库内的 KL-VAE，不是 JEPA teacher，也不是本实验新增的外部模型：
+
+```text
+实现: unified_video_action/vae/vaekl.py
+构造: unified_video_action/policy/unified_video_action_policy.py
+权重: pretrained_models/vae/kl16.ckpt
+latent channels: 16
+FVD encode 调用: unified_video_action/eval/eval.py
+                 -> unified_video_action/utils/data_utils.py
+```
+
+它只负责 RGB 帧与 MAR 16-channel latent 之间的编码/解码。本实验中它始终为 eval，
+所有参数 `requires_grad=false`，因此恢复 VAE 不改变可训练参数集合，也不会破坏“冻结
+MAR 主干、只训练 action head”的实验定义。
+
+重启还发现 torch hub 在本地已有 V-JEPA cache 时仍会先访问 GitHub；当前网络会偶发
+`RemoteDisconnected`。`unified_video_action/model/common/jepa_teacher.py` 现在优先
+从 `~/.cache/torch/hub/facebookresearch_vjepa2_main` 这类本地 cache 使用
+`source="local"`，没有 cache 时才回退原远程加载。实际本地 cache 加载测试已通过。
+
+修复后 run 使用新的时间戳目录，避免覆盖首次失败产物。
+
+### 17.10 为什么此前 DINOv2 能连续运行多个 epoch
+
+DINOv2 的成功运行并不与本次根因矛盾。实际 DINOv2 video-pretrained `conv_fc` run 为：
+
+```text
+run directory: checkpoints/uva_libero10_dinov2_small_token_feat_video_pretrained_conv_fc_action_20260809_003124
+resolved predict_video: true
+checkpoint: epoch=0040-test_mean_score=0.967.ckpt
+```
+
+该任务使用 commit `20931ba` 中的 policy；当时 `AutoencoderKL` 是无条件构建和冻结的：
+
+```python
+with torch.no_grad():
+    self.vae_model = AutoencoderKL(**vae_model_params)
+self.vae_model.eval()
+```
+
+所以 DINOv2 每个 epoch 的视频评估始终有可用 VAE。DINOv2 运行之后，工作区出现了
+student tokenizer 路径的 VAE 惰性初始化改动；其错误条件只考虑了 teacher/student，
+漏掉 `predict_video=true`，才使首次 V5 JEPA run 的 `vae_model` 成为 `None`。因此差异
+是运行时 policy 代码版本，不是 DINOv2 与 JEPA teacher 的区别，也不是 MAR 冻结或
+action head 解冻造成的区别。当前条件显式包含 `or predict_video`，同时覆盖 JEPA 和
+DINOv2 的视频生成/FVD 路径。

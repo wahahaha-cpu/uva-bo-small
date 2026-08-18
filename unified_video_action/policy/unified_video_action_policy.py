@@ -73,11 +73,23 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
         self.keep_mar_pos_and_fake_trainable = bool(
             kwargs.get("keep_mar_pos_and_fake_trainable", False)
         )
+        self.keep_mar_action_head_trainable = bool(
+            kwargs.get("keep_mar_action_head_trainable", False)
+        )
         self.mar_trainable_parameter_names = ()
 
-        if self.keep_mar_pos_and_fake_trainable and not self.freeze_mar:
+        if (
+            self.keep_mar_pos_and_fake_trainable
+            or self.keep_mar_action_head_trainable
+        ) and not self.freeze_mar:
             raise ValueError(
-                "keep_mar_pos_and_fake_trainable=True requires freeze_mar=True."
+                "MAR trainable whitelists require freeze_mar=True."
+            )
+        if self.keep_mar_action_head_trainable and not bool(
+            action_model_params.get("predict_action", False)
+        ):
+            raise ValueError(
+                "keep_mar_action_head_trainable=True requires predict_action=True."
             )
 
         # Alignment defaults are intentionally conservative for stable joint training.
@@ -118,12 +130,19 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
                 "This DINOv2 experiment requires align_on='token_feat'."
             )
 
-        ## =========================== load vae model ===========================
-        with torch.no_grad():
-            self.vae_model = AutoencoderKL(**vae_model_params)
-        self.vae_model.eval()
-        for param in self.vae_model.parameters():
-            param.requires_grad = False
+        # Student alignment consumes RGB directly, but video generation and FVD
+        # still encode/decode through the VAE even for JEPA/DINO teachers.
+        self.vae_model = None
+        if self._requires_vae_model(
+            use_student_tokenizer=self.use_student_tokenizer,
+            teacher_type=self.teacher_type,
+            predict_video=bool(autoregressive_model_params.predict_video),
+        ):
+            with torch.no_grad():
+                self.vae_model = AutoencoderKL(**vae_model_params)
+            self.vae_model.eval()
+            for param in self.vae_model.parameters():
+                param.requires_grad = False
 
         # =========================== frozen alignment teacher ===========================
         self.dinov2_teacher = None
@@ -268,6 +287,20 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
             }
         )
 
+    @staticmethod
+    def _requires_vae_model(
+        *, use_student_tokenizer: bool, teacher_type: str, predict_video: bool
+    ) -> bool:
+        return (
+            not use_student_tokenizer
+            or teacher_type == "vae"
+            or predict_video
+        )
+
+    @staticmethod
+    def _is_mar_action_head_parameter(name: str) -> bool:
+        return name == "diffactloss" or name.startswith("diffactloss.")
+
     def _configure_mar_trainability(self) -> None:
         if not self.freeze_mar:
             return
@@ -275,19 +308,29 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
         # Keep the MAR graph differentiable with respect to student latents; only
         # parameter gradients are disabled for the frozen modules.
         self.model.requires_grad_(False)
-        if self.keep_mar_pos_and_fake_trainable:
-            for name, param in self.model.named_parameters():
-                if self._is_mar_pos_or_fake_parameter(name):
-                    param.requires_grad = True
+        pos_and_fake_parameter_names = []
+        action_head_parameter_names = []
+        for name, param in self.model.named_parameters():
+            if (
+                self.keep_mar_pos_and_fake_trainable
+                and self._is_mar_pos_or_fake_parameter(name)
+            ):
+                param.requires_grad = True
+                pos_and_fake_parameter_names.append(name)
+            if (
+                self.keep_mar_action_head_trainable
+                and self._is_mar_action_head_parameter(name)
+            ):
+                param.requires_grad = True
+                action_head_parameter_names.append(name)
 
         self.mar_trainable_parameter_names = tuple(
             name for name, param in self.model.named_parameters() if param.requires_grad
         )
-        if (
-            self.keep_mar_pos_and_fake_trainable
-            and not self.mar_trainable_parameter_names
-        ):
+        if self.keep_mar_pos_and_fake_trainable and not pos_and_fake_parameter_names:
             raise RuntimeError("No trainable MAR position or fake parameters were found.")
+        if self.keep_mar_action_head_trainable and not action_head_parameter_names:
+            raise RuntimeError("No trainable MAR action-head parameters were found.")
 
     def load_pretrained_model(self):
         print("----------------------------------------------------------------------")

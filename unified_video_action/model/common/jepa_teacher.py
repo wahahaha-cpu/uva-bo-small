@@ -17,6 +17,24 @@ VJEPA2_HUB_MODELS = {
 }
 
 
+def _find_cached_hub_repo(hub_dir: str, repo: str) -> Optional[str]:
+    owner, name = repo.split("/", 1)
+    prefix = f"{owner}_{name}_"
+    candidates = [
+        os.path.join(hub_dir, prefix + ref)
+        for ref in ("main", "master")
+    ]
+    candidates.extend(
+        os.path.join(hub_dir, entry)
+        for entry in sorted(os.listdir(hub_dir))
+        if entry.startswith(prefix)
+    )
+    for candidate in candidates:
+        if os.path.isfile(os.path.join(candidate, "hubconf.py")):
+            return candidate
+    return None
+
+
 def _resolve_checkpoint_path(checkpoint_path: Optional[str]) -> str:
     if checkpoint_path is None or str(checkpoint_path).strip() == "":
         raise FileNotFoundError(
@@ -43,6 +61,14 @@ def _torch_hub_load_locked(
             fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             os.close(fd)
             try:
+                cached_repo = _find_cached_hub_repo(hub_dir, repo)
+                if cached_repo is not None:
+                    return torch.hub.load(
+                        cached_repo,
+                        model,
+                        source="local",
+                        pretrained=pretrained,
+                    )
                 return torch.hub.load(repo, model, pretrained=pretrained)
             finally:
                 try:

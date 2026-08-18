@@ -32,6 +32,11 @@ def is_mar_pos_or_fake_parameter(name: str) -> bool:
     )
 
 
+def is_mar_action_head_parameter(name: str) -> bool:
+    """Mirror UnifiedVideoActionPolicy._is_mar_action_head_parameter()."""
+    return name == "diffactloss" or name.startswith("diffactloss.")
+
+
 class TinyStudent(nn.Module):
     """Stand-in for the trainable student tokenizer."""
 
@@ -55,7 +60,7 @@ class TinyMar(nn.Module):
         self.z_proj_cond = nn.Linear(4, 8)
         self.encoder = nn.Sequential(nn.Linear(8, 8), nn.GELU())
         self.decoder = nn.Sequential(nn.Linear(8, 8), nn.GELU())
-        self.action_head = nn.Linear(8, 3)
+        self.diffactloss = nn.Linear(8, 3)
 
         self.fake_action_latent = nn.Parameter(torch.randn(1, 8) * 0.02)
         self.temporal_pos_embed = nn.Parameter(torch.randn(1, 8) * 0.02)
@@ -69,25 +74,33 @@ class TinyMar(nn.Module):
         hidden = hidden + self.fake_action_latent + self.temporal_pos_embed
         hidden = self.encoder(hidden)
         hidden = self.decoder(hidden)
-        return self.action_head(hidden)
+        return self.diffactloss(hidden)
 
 
 def configure_mar_trainability(
     mar: nn.Module,
     keep_pos_and_fake_trainable: bool,
+    keep_action_head_trainable: bool = False,
 ) -> tuple[str, ...]:
-    """Freeze all MAR parameters and optionally reopen the interface whitelist."""
+    """Freeze MAR and optionally reopen interface or action-head parameters."""
     mar.requires_grad_(False)
-    if keep_pos_and_fake_trainable:
-        for name, param in mar.named_parameters():
-            if is_mar_pos_or_fake_parameter(name):
-                param.requires_grad = True
+    pos_and_fake_names: list[str] = []
+    action_head_names: list[str] = []
+    for name, param in mar.named_parameters():
+        if keep_pos_and_fake_trainable and is_mar_pos_or_fake_parameter(name):
+            param.requires_grad = True
+            pos_and_fake_names.append(name)
+        if keep_action_head_trainable and is_mar_action_head_parameter(name):
+            param.requires_grad = True
+            action_head_names.append(name)
 
     trainable_names = tuple(
         name for name, param in mar.named_parameters() if param.requires_grad
     )
-    if keep_pos_and_fake_trainable and not trainable_names:
+    if keep_pos_and_fake_trainable and not pos_and_fake_names:
         raise RuntimeError("The MAR whitelist matched no parameters.")
+    if keep_action_head_trainable and not action_head_names:
+        raise RuntimeError("The MAR action-head whitelist matched no parameters.")
     return trainable_names
 
 
@@ -348,7 +361,65 @@ def main() -> None:
     print("Fully frozen MAR trainable parameter count: 0")
     print(f"Fully frozen MAR student grad norm: {strict_student_grad:.6e}")
     print("Fully frozen MAR optimizer/gradient/update checks: PASS")
-    print("PASS: selective and fully frozen MAR modes are both correct.")
+
+    # V5 mode: only diffactloss (the complete action conditioning adapter and
+    # diffusion MLP) is trainable inside MAR. The video MAR trunk stays frozen.
+    action_student = TinyStudent()
+    action_mar = TinyMar()
+    action_align_projector = nn.Linear(4, 4)
+    action_trainable_mar_names = configure_mar_trainability(
+        action_mar,
+        keep_pos_and_fake_trainable=False,
+        keep_action_head_trainable=True,
+    )
+    assert action_trainable_mar_names == (
+        "diffactloss.weight",
+        "diffactloss.bias",
+    )
+
+    action_optimizer_groups: list[dict[str, object]] = []
+    for module in (action_mar, action_student, action_align_projector):
+        action_optimizer_groups.extend(add_weight_decay(module, weight_decay=0.01))
+    action_optimizer = torch.optim.AdamW(action_optimizer_groups, lr=1e-2)
+    assert_optimizer_membership(
+        action_mar,
+        action_student,
+        action_align_projector,
+        action_optimizer,
+    )
+
+    action_mar_before = clone_parameters(action_mar)
+    action_optimizer.zero_grad(set_to_none=True)
+    trainable_action_loss = make_action_loss(
+        action_student,
+        action_mar,
+        observation,
+        action_target,
+    )
+    trainable_action_loss.backward()
+
+    assert module_grad_norm(action_student) > 0.0
+    assert module_grad_norm(action_mar.diffactloss) > 0.0
+    assert all(
+        param.grad is None
+        for name, param in action_mar.named_parameters()
+        if not is_mar_action_head_parameter(name)
+    )
+    assert module_grad_norm(action_align_projector) == 0.0
+
+    action_optimizer.step()
+    action_changed_mar_names = changed_parameter_names(action_mar, action_mar_before)
+    assert action_changed_mar_names
+    assert all(
+        is_mar_action_head_parameter(name) for name in action_changed_mar_names
+    )
+
+    print("Trainable action-head MAR parameters:")
+    for name in action_trainable_mar_names:
+        print(f"  {name}")
+    print("Frozen MAR trunk gradients: PASS (all None)")
+    print("Action-head-only optimizer/update checks: PASS")
+    print("PASS: selective, fully frozen, and action-head-only modes are correct.")
 
 
 if __name__ == "__main__":
