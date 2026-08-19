@@ -164,9 +164,12 @@ def main() -> None:
     assert torch.all(selected_indices[1:] > selected_indices[:-1])
 
     result = policy.compute_loss(
-        _clone_batch(batch), return_debug_components=True
+        _clone_batch(batch),
+        return_debug_components=True,
+        return_debug_outputs=True,
     )
-    total_loss, (video_loss, action_loss), components = result
+    total_loss, (video_loss, action_loss), components, debug_outputs = result
+    video_prediction = debug_outputs["video_prediction"]
     for label, value in components.items():
         assert torch.isfinite(value).all(), f"Non-finite {label}: {value}"
     assert torch.isfinite(video_loss).all()
@@ -187,16 +190,90 @@ def main() -> None:
         "jepa_student_probability_max",
         "jepa_teacher_entropy",
         "jepa_student_entropy",
+        "jepa_diffusion_timestep_mean",
+        "jepa_diffusion_timestep_min",
+        "jepa_diffusion_timestep_max",
+        "jepa_future_mask_fraction",
     ):
         value = policy._last_align_metrics.get(key)
         if value is not None:
             assert torch.isfinite(value).all(), f"Non-finite {key}: {value}"
             alignment_metrics[key] = value.detach().float().item()
     if policy.jepa_teacher is not None:
+        assert video_prediction is not None
+        predicted_future_latents = video_prediction["predicted_future_latents"]
+        diffusion_timesteps = video_prediction["diffusion_timesteps"]
+        future_mask = video_prediction["future_mask"]
+        assert predicted_future_latents.shape == (1, 4, 256, 16)
+        assert predicted_future_latents.requires_grad
+        assert diffusion_timesteps.shape == (1,)
+        assert torch.all(
+            diffusion_timesteps
+            == policy.model.diffloss.train_diffusion.num_timesteps - 1
+        )
+        assert future_mask.shape == (1, 4, 256)
+        assert torch.all(future_mask == 1)
+        assert alignment_metrics["jepa_future_mask_fraction"] == 1.0
         assert abs(alignment_metrics["jepa_teacher_row_sum_mean"] - 1.0) < 1e-5
         assert alignment_metrics["jepa_teacher_row_sum_max_error"] < 1e-5
         assert abs(alignment_metrics["jepa_student_row_sum_mean"] - 1.0) < 1e-5
         assert alignment_metrics["jepa_student_row_sum_max_error"] < 1e-5
+
+        decoder_probe = video_prediction["decoder_condition"].float().square().mean()
+        future_gradient, history_gradient = torch.autograd.grad(
+            decoder_probe,
+            (
+                video_prediction["future_input_latents"],
+                video_prediction["conditioning_input_latents"],
+            ),
+            retain_graph=True,
+            allow_unused=True,
+        )
+        future_gradient_norm = (
+            0.0
+            if future_gradient is None
+            else future_gradient.detach().float().norm().item()
+        )
+        history_gradient_norm = (
+            0.0
+            if history_gradient is None
+            else history_gradient.detach().float().norm().item()
+        )
+        assert future_gradient_norm < 1e-10
+        assert history_gradient_norm > 0.0
+
+        prediction_scale = (
+            predicted_future_latents.detach()
+            .float()
+            .square()
+            .mean()
+            .sqrt()
+            .clamp_min(1e-6)
+        )
+        prediction_probe = (
+            predicted_future_latents.float() / prediction_scale
+        ).square().mean()
+        prediction_future_gradient, prediction_history_gradient = torch.autograd.grad(
+            prediction_probe,
+            (
+                video_prediction["future_input_latents"],
+                video_prediction["conditioning_input_latents"],
+            ),
+            retain_graph=True,
+            allow_unused=True,
+        )
+        prediction_future_gradient_norm = (
+            0.0
+            if prediction_future_gradient is None
+            else prediction_future_gradient.detach().float().norm().item()
+        )
+        prediction_history_gradient_norm = (
+            0.0
+            if prediction_history_gradient is None
+            else prediction_history_gradient.detach().float().norm().item()
+        )
+        assert prediction_future_gradient_norm < 1e-10
+        assert prediction_history_gradient_norm > 0.0
 
     student_parameters = tuple(policy.student_tokenizer.parameters())
     component_gradient_norms = {
@@ -210,11 +287,28 @@ def main() -> None:
             components["weighted_jepa_loss"], student_parameters
         ),
     }
+    if policy.jepa_teacher is not None:
+        component_gradient_norms["grad_norm_base_to_video_diffusion"] = (
+            _gradient_norm(
+                components["base_loss"],
+                policy.model.diffloss.parameters(),
+            )
+        )
+        component_gradient_norms["grad_norm_jepa_to_video_diffusion"] = (
+            _gradient_norm(
+                components["weighted_jepa_loss"],
+                policy.model.diffloss.parameters(),
+            )
+        )
+        assert component_gradient_norms[
+            "grad_norm_jepa_to_video_diffusion"
+        ] > 0.0
 
     policy.zero_grad(set_to_none=True)
     total_loss.backward()
     module_summaries = {
-        "student_tokenizer": _module_gradient_summary(policy.student_tokenizer)
+        "student_tokenizer": _module_gradient_summary(policy.student_tokenizer),
+        "video_diffusion_head": _module_gradient_summary(policy.model.diffloss),
     }
     if policy.student_to_dino_projector is not None:
         module_summaries["student_to_dino_projector"] = _module_gradient_summary(
@@ -239,6 +333,7 @@ def main() -> None:
     )
     if has_auxiliary_teacher:
         assert module_summaries["student_tokenizer"]["gradient_norm"] > 0.0
+    assert module_summaries["video_diffusion_head"]["gradient_norm"] > 0.0
     for label, summary in module_summaries.items():
         assert summary["gradient_tensors"] > 0, f"No gradient for {label}"
         if has_auxiliary_teacher or label != "student_tokenizer":
@@ -268,10 +363,12 @@ def main() -> None:
     temporal_metrics = {}
     if policy.temporal_fusion is not None:
         with torch.no_grad():
-            _, history_student_tokens = policy.student_tokenizer(history_clip)
-            s0, s1 = history_student_tokens[:, :2].unbind(dim=1)
-            fused_forward = policy.temporal_fusion(s0, s1)
-            fused_swapped = policy.temporal_fusion(s1, s0)
+            predicted_future_latents = video_prediction[
+                "predicted_future_latents"
+            ]
+            f0, f1 = predicted_future_latents[:, :2].unbind(dim=1)
+            fused_forward = policy.temporal_fusion(f0, f1)
+            fused_swapped = policy.temporal_fusion(f1, f0)
             fusion_order_difference = (
                 fused_forward - fused_swapped
             ).abs().mean()
@@ -287,11 +384,11 @@ def main() -> None:
                 teacher_tokens,
                 metadata,
             ) = policy._extract_jepa_relational_target(
-                history_clip, return_metadata=True
+                future_clip, return_metadata=True
             )
             probability_reverse, relation_reverse, _, _ = (
                 policy._extract_jepa_relational_target(
-                    history_clip.flip(2), return_metadata=True
+                    future_clip.flip(2), return_metadata=True
                 )
             )
             assert teacher_tokens.shape == (1, 2, 576, 768)
@@ -314,6 +411,23 @@ def main() -> None:
         )
         temporal_metrics["jepa_relation_reverse_cosine"] = jepa_reverse_cosine.item()
         temporal_metrics["jepa_patch_embed_shape"] = metadata["patch_embed_shape"]
+        temporal_metrics["video_diffusion_pred_x0_shape"] = tuple(
+            predicted_future_latents.shape
+        )
+        temporal_metrics["future_mask_fraction"] = (
+            video_prediction["future_mask"].float().mean().item()
+        )
+        temporal_metrics["diffusion_timesteps"] = (
+            video_prediction["diffusion_timesteps"].tolist()
+        )
+        temporal_metrics["decoder_grad_wrt_future_input"] = future_gradient_norm
+        temporal_metrics["decoder_grad_wrt_history_input"] = history_gradient_norm
+        temporal_metrics["prediction_grad_wrt_future_input"] = (
+            prediction_future_gradient_norm
+        )
+        temporal_metrics["prediction_grad_wrt_history_input"] = (
+            prediction_history_gradient_norm
+        )
 
     print("--- one-real-batch verification ---")
     print(f"config: {args.config_name}")
@@ -321,6 +435,14 @@ def main() -> None:
     print(f"selected_frame_indices: {selected_indices.tolist()}")
     print(f"history_clip: {tuple(history_clip.shape)}")
     print(f"future_clip: {tuple(future_clip.shape)}")
+    if video_prediction is not None:
+        print(
+            "video_prediction: "
+            f"pred_x0={tuple(video_prediction['predicted_future_latents'].shape)}, "
+            f"decoder_condition={tuple(video_prediction['decoder_condition'].shape)}, "
+            f"mask={tuple(video_prediction['future_mask'].shape)}, "
+            f"timesteps={video_prediction['diffusion_timesteps'].tolist()}"
+        )
     print(
         "losses: "
         f"base={components['base_loss'].detach().float().item():.8f}, "

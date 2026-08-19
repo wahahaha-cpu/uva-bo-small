@@ -216,6 +216,12 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
                 raise ValueError("Teacher loss coefficients must be non-negative.")
             if self.enable_jepa_dynamics and self.jepa_relation_temperature <= 0.0:
                 raise ValueError("jepa_relation_temperature must be positive.")
+            if self.enable_jepa_dynamics and not bool(
+                autoregressive_model_params.predict_video
+            ):
+                raise ValueError(
+                    "JEPA future-latent supervision requires predict_video=True."
+                )
 
         # Student alignment consumes RGB directly, but video generation and FVD
         # still encode/decode through the VAE even for JEPA/DINO teachers.
@@ -308,6 +314,14 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
                 )
 
             hidden_dim = int(self.student_tokenizer_params.get("hidden_dim", 384))
+            future_latent_channels = int(
+                self.student_tokenizer_params.get(
+                    "latent_channels", autoregressive_model_params.vae_embed_dim
+                )
+            )
+            future_latent_dim = future_latent_channels * int(
+                autoregressive_model_params.patch_size
+            ) ** 2
             if self.enable_dino_spatial:
                 with _isolated_rng(self.dual_init_seed + 1):
                     self.student_to_dino_projector = torch.nn.Sequential(
@@ -323,11 +337,13 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
                     )
             if self.enable_jepa_dynamics:
                 with _isolated_rng(self.dual_init_seed + 2):
-                    self.temporal_fusion = TemporalFusionMLP(hidden_dim)
+                    self.temporal_fusion = TemporalFusionMLP(future_latent_dim)
                 with _isolated_rng(self.dual_init_seed + 3):
                     self.student_to_jepa_projector = torch.nn.Sequential(
-                        torch.nn.LayerNorm(hidden_dim),
-                        torch.nn.Linear(hidden_dim, self.dual_projector_dim),
+                        torch.nn.LayerNorm(future_latent_dim),
+                        torch.nn.Linear(
+                            future_latent_dim, self.dual_projector_dim
+                        ),
                         torch.nn.GELU(),
                         torch.nn.Linear(
                             self.dual_projector_dim, self.jepa_teacher.feat_dim
@@ -361,6 +377,16 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
             diffusion_batch_mul=autoregressive_model_params.diffusion_batch_mul,
             grad_checkpointing=autoregressive_model_params.grad_checkpointing,
             predict_video=autoregressive_model_params.predict_video,
+            causal_future_mask=bool(
+                getattr(autoregressive_model_params, "causal_future_mask", False)
+            ),
+            shared_video_diffusion_timestep=bool(
+                getattr(
+                    autoregressive_model_params,
+                    "shared_video_diffusion_timestep",
+                    False,
+                )
+            ),
             act_diff_training_steps=self.autoregressive_model_params.act_diff_training_steps,
             act_diff_testing_steps=self.autoregressive_model_params.act_diff_testing_steps,
             action_model_params=action_model_params,
@@ -401,6 +427,30 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
                 self.task_modes = ["policy_model", "full_dynamic_model"]
             else:
                 self.task_modes = [self.selected_training_mode]
+        if self.enable_jepa_dynamics:
+            video_training_modes = {
+                "video_model",
+                "dynamic_model",
+                "full_dynamic_model",
+            }
+            invalid_modes = [
+                mode for mode in self.task_modes if mode not in video_training_modes
+            ]
+            if invalid_modes:
+                raise ValueError(
+                    "JEPA future-latent supervision requires a video training "
+                    f"mode, got {invalid_modes}."
+                )
+            if not self.model.causal_future_mask:
+                raise ValueError(
+                    "JEPA future-latent supervision requires "
+                    "causal_future_mask=True."
+                )
+            if not self.model.shared_video_diffusion_timestep:
+                raise ValueError(
+                    "JEPA future-latent supervision requires one shared "
+                    "diffusion timestep per video."
+                )
         print("----------------------------------------------------------------------")
         print("task_modes", self.task_modes)
         print("----------------------------------------------------------------------")
@@ -928,26 +978,29 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
         )
         return dino_loss, metrics, teacher_tokens, projected_student
 
-    def _compute_student_temporal_regions(self, student_tokens: torch.Tensor):
-        if student_tokens.ndim != 4:
+    def _compute_future_latent_temporal_regions(
+        self, predicted_future_latents: torch.Tensor
+    ):
+        if predicted_future_latents.ndim != 4:
             raise ValueError(
-                f"Expected Student tokens [B,T,N,D], got {tuple(student_tokens.shape)}"
+                "Expected video-diffusion future latents [B,T,N,D], got "
+                f"{tuple(predicted_future_latents.shape)}"
             )
-        if student_tokens.shape[1] != self.dual_required_frames:
+        if predicted_future_latents.shape[1] != self.dual_required_frames:
             raise ValueError(
-                f"Expected {self.dual_required_frames} Student frames, got "
-                f"{student_tokens.shape[1]}"
+                f"Expected {self.dual_required_frames} predicted frames, got "
+                f"{predicted_future_latents.shape[1]}"
             )
-        s0, s1, s2, s3 = student_tokens.unbind(dim=1)
-        h01 = self.temporal_fusion(s0, s1)
-        h23 = self.temporal_fusion(s2, s3)
+        f0, f1, f2, f3 = predicted_future_latents.unbind(dim=1)
+        h01 = self.temporal_fusion(f0, f1)
+        h23 = self.temporal_fusion(f2, f3)
         q01 = self.student_to_jepa_projector(h01)
         q23 = self.student_to_jepa_projector(h23)
         return {
-            "s0": s0,
-            "s1": s1,
-            "s2": s2,
-            "s3": s3,
+            "future0": f0,
+            "future1": f1,
+            "future2": f2,
+            "future3": f3,
             "h01": h01,
             "h23": h23,
             "q01": q01,
@@ -1002,7 +1055,7 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
     def _compute_jepa_dynamics_alignment(
         self,
         video: torch.Tensor,
-        student_tokens: torch.Tensor,
+        predicted_future_latents: torch.Tensor,
         return_metadata: bool = False,
     ):
         (
@@ -1011,7 +1064,9 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
             teacher_tokens,
             metadata,
         ) = self._extract_jepa_relational_target(video, return_metadata=return_metadata)
-        temporal_regions = self._compute_student_temporal_regions(student_tokens)
+        temporal_regions = self._compute_future_latent_temporal_regions(
+            predicted_future_latents
+        )
         q01 = self._resample_spatial_tokens(
             temporal_regions["q01"],
             target_token_count=teacher_tokens.shape[2],
@@ -1029,6 +1084,9 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
             teacher_probabilities.detach(),
             reduction="batchmean",
         )
+        # batchmean sums over query patches; average those rows so the
+        # auxiliary scale does not grow with the JEPA spatial resolution.
+        jepa_loss = jepa_loss / teacher_probabilities.shape[-2]
 
         student_probabilities = student_log_probabilities.exp()
         teacher_row_sums = teacher_probabilities.sum(dim=-1)
@@ -1078,123 +1136,155 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
             metadata,
         )
 
-    def _compute_dual_teacher_clip_losses(
-        self,
-        video: torch.Tensor,
-        student_tokens: torch.Tensor,
-        capture_shapes: bool = False,
-    ):
-        if video.shape[2] != self.dual_required_frames:
-            raise ValueError(
-                f"Dual-teacher clip must contain {self.dual_required_frames} frames, "
-                f"got {tuple(video.shape)}"
-            )
-        zero = student_tokens.new_zeros(())
-        dino_loss = zero
-        jepa_loss = zero
-        metrics = {}
-        shapes = {
-            "rgb": tuple(video.shape),
-            "student": tuple(student_tokens.shape),
-        }
-
-        if self.enable_dino_spatial:
-            (
-                dino_loss,
-                dino_metrics,
-                dino_tokens,
-                projected_dino,
-            ) = self._compute_dino_spatial_alignment(video, student_tokens)
-            metrics.update(
-                {
-                    "dino_cos": dino_metrics["cosine"],
-                    "dino_mse": dino_metrics["mse"],
-                    "dino_stats": dino_metrics["stats"],
-                    "dino_student_norm": dino_metrics["student_norm"],
-                    "dino_teacher_norm": dino_metrics["teacher_norm"],
-                }
-            )
-            if capture_shapes:
-                shapes["dino"] = tuple(dino_tokens.shape)
-                shapes["student_to_dino"] = tuple(projected_dino.shape)
-
-        if self.enable_jepa_dynamics:
-            (
-                jepa_loss,
-                jepa_metrics,
-                jepa_tokens,
-                teacher_relations,
-                teacher_probabilities,
-                temporal_regions,
-                jepa_metadata,
-            ) = self._compute_jepa_dynamics_alignment(
-                video, student_tokens, return_metadata=capture_shapes
-            )
-            metrics.update(
-                {
-                    f"jepa_{key}": value for key, value in jepa_metrics.items()
-                }
-            )
-            if capture_shapes:
-                shapes.update(
-                    {
-                        "jepa_input": jepa_metadata["input_shape"],
-                        "jepa_patch_embed": jepa_metadata["patch_embed_shape"],
-                        "raw_jepa": jepa_metadata["raw_output_shape"],
-                        "reshaped_jepa": tuple(jepa_tokens.shape),
-                        "j01": tuple(jepa_tokens[:, 0].shape),
-                        "j23": tuple(jepa_tokens[:, 1].shape),
-                        "q01": tuple(temporal_regions["q01"].shape),
-                        "q23": tuple(temporal_regions["q23"].shape),
-                        "r_jepa": tuple(teacher_relations.shape),
-                        "p_jepa": tuple(teacher_probabilities.shape),
-                        "r_student": tuple(
-                            temporal_regions["student_relations"].shape
-                        ),
-                        "p_student": tuple(
-                            temporal_regions["student_probabilities"].shape
-                        ),
-                        "s0": tuple(temporal_regions["s0"].shape),
-                        "s1": tuple(temporal_regions["s1"].shape),
-                        "s2": tuple(temporal_regions["s2"].shape),
-                        "s3": tuple(temporal_regions["s3"].shape),
-                        "h01": tuple(temporal_regions["h01"].shape),
-                        "h23": tuple(temporal_regions["h23"].shape),
-                    }
-                )
-        return dino_loss, jepa_loss, metrics, shapes
-
     def _compute_dual_teacher_pair_losses(
         self,
         conditioning_video: torch.Tensor,
         conditioning_student: torch.Tensor,
         target_video: torch.Tensor,
         target_student: torch.Tensor,
+        video_prediction: Optional[Dict[str, torch.Tensor]] = None,
         capture_shapes: bool = False,
     ):
-        """Compute both clips while preserving the base objective's RNG stream.
+        """Keep DINO on tokenizer features and JEPA on predicted future latents."""
+        for video in (conditioning_video, target_video):
+            if video.shape[2] != self.dual_required_frames:
+                raise ValueError(
+                    "Foundation-teacher clips must contain "
+                    f"{self.dual_required_frames} frames, got {tuple(video.shape)}"
+                )
 
-        Teacher backbones and auxiliary projections are deterministic for a fixed
-        batch, but keeping the whole auxiliary scope isolated also protects the
-        action/diffusion sampling path from backend-specific CUDA RNG use.
-        """
-        with _isolated_rng(preserve_cuda=True):
-            dino_c, jepa_c, metrics_c, shapes = self._compute_dual_teacher_clip_losses(
-                conditioning_video,
-                conditioning_student,
-                capture_shapes=capture_shapes,
-            )
-            dino_z, jepa_z, metrics_z, _ = self._compute_dual_teacher_clip_losses(
-                target_video,
-                target_student,
-                capture_shapes=False,
-            )
-        dino_loss = 0.5 * (dino_c + dino_z)
-        jepa_loss = 0.5 * (jepa_c + jepa_z)
-        metrics = {
-            key: 0.5 * (metrics_c[key] + metrics_z[key])
-            for key in metrics_c
+        zero = target_student.new_zeros(())
+        dino_loss = zero
+        jepa_loss = zero
+        metrics = {}
+        shapes = {
+            "conditioning_rgb": tuple(conditioning_video.shape),
+            "future_rgb": tuple(target_video.shape),
+            "student_token_feat": tuple(target_student.shape),
         }
+
+        with _isolated_rng(preserve_cuda=True):
+            if self.enable_dino_spatial:
+                dino_c, metrics_c, _, _ = self._compute_dino_spatial_alignment(
+                    conditioning_video, conditioning_student
+                )
+                (
+                    dino_z,
+                    metrics_z,
+                    dino_tokens,
+                    projected_dino,
+                ) = self._compute_dino_spatial_alignment(
+                    target_video, target_student
+                )
+                dino_loss = 0.5 * (dino_c + dino_z)
+                metrics.update(
+                    {
+                        "dino_cos": 0.5
+                        * (metrics_c["cosine"] + metrics_z["cosine"]),
+                        "dino_mse": 0.5
+                        * (metrics_c["mse"] + metrics_z["mse"]),
+                        "dino_stats": 0.5
+                        * (metrics_c["stats"] + metrics_z["stats"]),
+                        "dino_student_norm": 0.5
+                        * (
+                            metrics_c["student_norm"]
+                            + metrics_z["student_norm"]
+                        ),
+                        "dino_teacher_norm": 0.5
+                        * (
+                            metrics_c["teacher_norm"]
+                            + metrics_z["teacher_norm"]
+                        ),
+                    }
+                )
+                if capture_shapes:
+                    shapes["dino"] = tuple(dino_tokens.shape)
+                    shapes["student_to_dino"] = tuple(projected_dino.shape)
+
+            if self.enable_jepa_dynamics:
+                if video_prediction is None:
+                    raise RuntimeError(
+                        "JEPA supervision requires video-diffusion future latents."
+                    )
+                predicted_future_latents = video_prediction[
+                    "predicted_future_latents"
+                ]
+                (
+                    jepa_loss,
+                    jepa_metrics,
+                    jepa_tokens,
+                    teacher_relations,
+                    teacher_probabilities,
+                    temporal_regions,
+                    jepa_metadata,
+                ) = self._compute_jepa_dynamics_alignment(
+                    target_video,
+                    predicted_future_latents,
+                    return_metadata=capture_shapes,
+                )
+                metrics.update(
+                    {
+                        f"jepa_{key}": value
+                        for key, value in jepa_metrics.items()
+                    }
+                )
+                diffusion_timesteps = video_prediction["diffusion_timesteps"]
+                metrics.update(
+                    {
+                        "jepa_diffusion_timestep_mean": diffusion_timesteps.float()
+                        .mean()
+                        .detach(),
+                        "jepa_diffusion_timestep_min": diffusion_timesteps.min()
+                        .detach(),
+                        "jepa_diffusion_timestep_max": diffusion_timesteps.max()
+                        .detach(),
+                        "jepa_future_mask_fraction": video_prediction["future_mask"]
+                        .float()
+                        .mean()
+                        .detach(),
+                    }
+                )
+                if capture_shapes:
+                    shapes.update(
+                        {
+                            "video_decoder_condition": tuple(
+                                video_prediction["decoder_condition"].shape
+                            ),
+                            "video_diffusion_pred_x0": tuple(
+                                predicted_future_latents.shape
+                            ),
+                            "future_mask": tuple(
+                                video_prediction["future_mask"].shape
+                            ),
+                            "diffusion_timesteps": tuple(
+                                diffusion_timesteps.shape
+                            ),
+                            "jepa_input": jepa_metadata["input_shape"],
+                            "jepa_patch_embed": jepa_metadata[
+                                "patch_embed_shape"
+                            ],
+                            "raw_jepa": jepa_metadata["raw_output_shape"],
+                            "reshaped_jepa": tuple(jepa_tokens.shape),
+                            "j01": tuple(jepa_tokens[:, 0].shape),
+                            "j23": tuple(jepa_tokens[:, 1].shape),
+                            "q01": tuple(temporal_regions["q01"].shape),
+                            "q23": tuple(temporal_regions["q23"].shape),
+                            "r_jepa": tuple(teacher_relations.shape),
+                            "p_jepa": tuple(teacher_probabilities.shape),
+                            "r_student": tuple(
+                                temporal_regions["student_relations"].shape
+                            ),
+                            "p_student": tuple(
+                                temporal_regions["student_probabilities"].shape
+                            ),
+                            "future0": tuple(temporal_regions["future0"].shape),
+                            "future1": tuple(temporal_regions["future1"].shape),
+                            "future2": tuple(temporal_regions["future2"].shape),
+                            "future3": tuple(temporal_regions["future3"].shape),
+                            "h01": tuple(temporal_regions["h01"].shape),
+                            "h23": tuple(temporal_regions["h23"].shape),
+                        }
+                    )
         return dino_loss, jepa_loss, metrics, shapes
 
     def _log_dual_teacher_first_forward(
@@ -1214,20 +1304,25 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
 
         print("--- foundation-teacher first-forward shapes ---", flush=True)
         for label in (
-            "rgb",
-            "student",
+            "conditioning_rgb",
+            "future_rgb",
+            "student_token_feat",
             "dino",
             "student_to_dino",
+            "video_decoder_condition",
+            "video_diffusion_pred_x0",
+            "future_mask",
+            "diffusion_timesteps",
             "jepa_input",
             "jepa_patch_embed",
             "raw_jepa",
             "reshaped_jepa",
             "j01",
             "j23",
-            "s0",
-            "s1",
-            "s2",
-            "s3",
+            "future0",
+            "future1",
+            "future2",
+            "future3",
             "h01",
             "h23",
             "q01",
@@ -1249,6 +1344,8 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
         )
         if alignment_metrics:
             metric_names = (
+                "video_loss",
+                "action_loss",
                 "dino_cos",
                 "dino_mse",
                 "dino_stats",
@@ -1263,6 +1360,10 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
                 "jepa_student_probability_max",
                 "jepa_teacher_entropy",
                 "jepa_student_entropy",
+                "jepa_diffusion_timestep_mean",
+                "jepa_diffusion_timestep_min",
+                "jepa_diffusion_timestep_max",
+                "jepa_future_mask_fraction",
             )
             logged_metrics = {
                 name: alignment_metrics[name].detach().float().item()
@@ -1402,20 +1503,6 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
                     * (metrics_z["teacher_norm"] + metrics_c["teacher_norm"]),
                 }
 
-            if self.use_dual_teacher_alignment:
-                capture_shapes = not self._dual_teacher_shapes_logged
-                (
-                    dino_loss,
-                    jepa_loss,
-                    dual_metrics,
-                    dual_shapes,
-                ) = self._compute_dual_teacher_pair_losses(
-                    c_img,
-                    c_token_feat,
-                    x_img,
-                    z_token_feat,
-                    capture_shapes=capture_shapes,
-                )
         else:
             x, z, c, _, proprioception_input = get_vae_latent(
                 x, self.vae_model, eval=False, proprioception_input=proprioception_input
@@ -1426,7 +1513,7 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
 
         selected_mode = random.choice(self.task_modes)
 
-        base_loss, video_loss, act_loss = self.model(
+        model_result = self.model(
             z,
             c,
             history_trajectory,
@@ -1434,7 +1521,35 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
             text_latents,
             task_mode=selected_mode,
             proprioception_input=proprioception_input,
+            return_video_prediction=self.enable_jepa_dynamics,
         )
+        if self.enable_jepa_dynamics:
+            base_loss, video_loss, act_loss, video_prediction = model_result
+        else:
+            base_loss, video_loss, act_loss = model_result
+            video_prediction = None
+
+        if self.use_dual_teacher_alignment:
+            capture_shapes = not self._dual_teacher_shapes_logged
+            (
+                dino_loss,
+                jepa_loss,
+                dual_metrics,
+                dual_shapes,
+            ) = self._compute_dual_teacher_pair_losses(
+                c_img,
+                c_token_feat,
+                x_img,
+                z_token_feat,
+                video_prediction=video_prediction,
+                capture_shapes=capture_shapes,
+            )
+            dual_metrics.update(
+                {
+                    "video_loss": video_loss.detach(),
+                    "action_loss": act_loss.detach(),
+                }
+            )
         loss = base_loss
         if self.use_student_tokenizer and self.use_alignment:
             loss = loss + self.align_coeff * align_loss
@@ -1450,6 +1565,8 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
             **legacy_metrics,
             **dual_metrics,
             "base_loss": base_loss.detach(),
+            "video_loss": video_loss.detach(),
+            "action_loss": act_loss.detach(),
             "dino_loss": dino_loss.detach(),
             "jepa_loss": jepa_loss.detach(),
             "weighted_dino_loss": (self.lambda_dino * dino_loss).detach(),
@@ -1503,6 +1620,8 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
         if kwargs.get("return_debug_components", False):
             components = {
                 "base_loss": base_loss,
+                "video_loss": video_loss,
+                "action_loss": act_loss,
                 "legacy_align_loss": align_loss,
                 "dino_loss": dino_loss,
                 "jepa_loss": jepa_loss,
@@ -1510,6 +1629,13 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
                 "weighted_jepa_loss": self.lambda_jepa * jepa_loss,
                 "total_loss": total_loss_without_unused_terms,
             }
+            if kwargs.get("return_debug_outputs", False):
+                return (
+                    loss,
+                    (video_loss, act_loss),
+                    components,
+                    {"video_prediction": video_prediction},
+                )
             return loss, (video_loss, act_loss), components
         return loss, (video_loss, act_loss)
 

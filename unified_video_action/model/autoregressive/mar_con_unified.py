@@ -54,6 +54,8 @@ class MAR(nn.Module):
         diffusion_batch_mul=4,
         grad_checkpointing=False,
         predict_video=True,
+        causal_future_mask=False,
+        shared_video_diffusion_timestep=False,
         act_diff_training_steps=1000,
         act_diff_testing_steps="100",
         action_model_params={},
@@ -69,6 +71,10 @@ class MAR(nn.Module):
         self.predict_wrist_img = kwargs["predict_wrist_img"]
         self.predict_proprioception = kwargs["predict_proprioception"]
         self.n_frames = 4
+        self.causal_future_mask = bool(causal_future_mask)
+        self.shared_video_diffusion_timestep = bool(
+            shared_video_diffusion_timestep
+        )
 
         # ========= VAE and patchify specifics =========
         self.img_size = img_size
@@ -725,6 +731,43 @@ class MAR(nn.Module):
 
         return x
 
+    def _video_diffusion_forward(
+        self,
+        z,
+        target,
+        mask,
+        text_latents,
+        gt_wrist_latents,
+        return_video_prediction,
+    ):
+        video_result = self.diffloss(
+            z=z,
+            target=target,
+            mask=mask,
+            text_latents=text_latents,
+            return_prediction=return_video_prediction,
+            shared_timestep=(
+                self.shared_video_diffusion_timestep
+                or return_video_prediction
+            ),
+        )
+        if return_video_prediction:
+            video_loss, predicted_future_latents, diffusion_timesteps = video_result
+        else:
+            video_loss = video_result
+            predicted_future_latents = None
+            diffusion_timesteps = None
+
+        if self.predict_wrist_img:
+            video_loss_wrist = self.diffloss_wrist(
+                z=z,
+                target=gt_wrist_latents,
+                mask=mask,
+                text_latents=text_latents,
+            )
+            video_loss = video_loss + video_loss_wrist
+        return video_loss, predicted_future_latents, diffusion_timesteps
+
     def forward_loss(
         self,
         z,
@@ -735,25 +778,32 @@ class MAR(nn.Module):
         gt_wrist_latents=None,
         gt_properception=None,
         text_latents=None,
+        return_video_prediction=False,
     ):
+        predicted_future_latents = None
+        diffusion_timesteps = None
         if task_mode == "video_model" or task_mode == "dynamic_model":
-            if self.predict_wrist_img:
-                video_loss = self.diffloss(
-                    z=z, target=target, mask=mask, text_latents=text_latents
-                )
-                video_loss_wrist = self.diffloss_wrist(
-                    z=z, target=gt_wrist_latents, mask=mask, text_latents=text_latents
-                )
-                video_loss = video_loss + video_loss_wrist
-            else:
-                video_loss = self.diffloss(
-                    z=z, target=target, mask=mask, text_latents=text_latents
-                )
+            (
+                video_loss,
+                predicted_future_latents,
+                diffusion_timesteps,
+            ) = self._video_diffusion_forward(
+                z,
+                target,
+                mask,
+                text_latents,
+                gt_wrist_latents,
+                return_video_prediction,
+            )
 
             act_loss = torch.tensor(0.0).to(self.device)
             loss = video_loss
 
         elif task_mode == "policy_model" or task_mode == "inverse_model":
+            if return_video_prediction:
+                raise ValueError(
+                    "Future-latent prediction requires a video training mode."
+                )
             act_loss = self.diffactloss(
                 z=z, target=nactions, task_mode=task_mode, text_latents=text_latents
             )
@@ -761,18 +811,18 @@ class MAR(nn.Module):
             loss = act_loss
 
         elif task_mode == "full_dynamic_model":
-            if self.predict_wrist_img:
-                video_loss = self.diffloss(
-                    z=z, target=target, mask=mask, text_latents=text_latents
-                )
-                video_loss_wrist = self.diffloss_wrist(
-                    z=z, target=gt_wrist_latents, mask=mask, text_latents=text_latents
-                )
-                video_loss = video_loss + video_loss_wrist
-            else:
-                video_loss = self.diffloss(
-                    z=z, target=target, mask=mask, text_latents=text_latents
-                )
+            (
+                video_loss,
+                predicted_future_latents,
+                diffusion_timesteps,
+            ) = self._video_diffusion_forward(
+                z,
+                target,
+                mask,
+                text_latents,
+                gt_wrist_latents,
+                return_video_prediction,
+            )
             act_loss = self.diffactloss(
                 z=z, target=nactions, task_mode=task_mode, text_latents=text_latents
             )
@@ -784,7 +834,13 @@ class MAR(nn.Module):
             )
             loss = loss + properception_loss
 
-        return loss, video_loss, act_loss
+        return (
+            loss,
+            video_loss,
+            act_loss,
+            predicted_future_latents,
+            diffusion_timesteps,
+        )
 
     def forward(
         self,
@@ -795,9 +851,12 @@ class MAR(nn.Module):
         text_latents=None,
         task_mode=None,
         proprioception_input={},
+        return_video_prediction=False,
     ):
         self.device = cond.device
         B, T, C, H, W = imgs.size()
+        future_input_latents = imgs
+        conditioning_input_latents = cond
 
         # ========= Patchify =========
         imgs = rearrange(
@@ -862,6 +921,13 @@ class MAR(nn.Module):
         # ========= Sample Orders =========
         orders = self.sample_orders(bsz=B)
         mask = self.random_masking(x, orders)  # [1, 4, 256]
+        if self.causal_future_mask and task_mode in (
+            "video_model",
+            "dynamic_model",
+            "full_dynamic_model",
+        ):
+            mask = torch.ones_like(mask)
+        future_mask = mask
 
         # ========= MAE Encoder =========
         x = self.forward_mae_encoder(
@@ -899,7 +965,13 @@ class MAR(nn.Module):
                 raise NotImplementedError
 
             if self.predict_wrist_img:
-                loss, video_loss, act_loss = self.forward_loss(
+                (
+                    loss,
+                    video_loss,
+                    act_loss,
+                    predicted_future_latents,
+                    diffusion_timesteps,
+                ) = self.forward_loss(
                     z=z,
                     target=gt_latents,
                     mask=mask,
@@ -908,9 +980,16 @@ class MAR(nn.Module):
                     gt_wrist_latents=gt_wrist_latents,
                     gt_properception=gt_properception,
                     text_latents=text_latents,
+                    return_video_prediction=return_video_prediction,
                 )
             else:
-                loss, video_loss, act_loss = self.forward_loss(
+                (
+                    loss,
+                    video_loss,
+                    act_loss,
+                    predicted_future_latents,
+                    diffusion_timesteps,
+                ) = self.forward_loss(
                     z=z,
                     target=gt_latents,
                     mask=mask,
@@ -918,10 +997,17 @@ class MAR(nn.Module):
                     task_mode=task_mode,
                     gt_properception=gt_properception,
                     text_latents=text_latents,
+                    return_video_prediction=return_video_prediction,
                 )
         else:
             if self.predict_wrist_img:
-                loss, video_loss, act_loss = self.forward_loss(
+                (
+                    loss,
+                    video_loss,
+                    act_loss,
+                    predicted_future_latents,
+                    diffusion_timesteps,
+                ) = self.forward_loss(
                     z=z,
                     target=gt_latents,
                     mask=mask,
@@ -929,17 +1015,43 @@ class MAR(nn.Module):
                     task_mode=task_mode,
                     gt_wrist_latents=gt_wrist_latents,
                     text_latents=text_latents,
+                    return_video_prediction=return_video_prediction,
                 )
             else:
-                loss, video_loss, act_loss = self.forward_loss(
+                (
+                    loss,
+                    video_loss,
+                    act_loss,
+                    predicted_future_latents,
+                    diffusion_timesteps,
+                ) = self.forward_loss(
                     z=z,
                     target=gt_latents,
                     mask=mask,
                     nactions=nactions,
                     task_mode=task_mode,
                     text_latents=text_latents,
+                    return_video_prediction=return_video_prediction,
                 )
 
+        if return_video_prediction:
+            if predicted_future_latents is None or diffusion_timesteps is None:
+                raise RuntimeError("Video diffusion did not return a future prediction.")
+            predicted_future_latents = rearrange(
+                predicted_future_latents,
+                "b (t s) c -> b t s c",
+                t=T,
+                s=self.seq_len,
+            )
+            prediction = {
+                "predicted_future_latents": predicted_future_latents,
+                "diffusion_timesteps": diffusion_timesteps,
+                "future_mask": future_mask,
+                "decoder_condition": z,
+                "future_input_latents": future_input_latents,
+                "conditioning_input_latents": conditioning_input_latents,
+            }
+            return loss, video_loss, act_loss, prediction
         return loss, video_loss, act_loss
 
     def sample_tokens(

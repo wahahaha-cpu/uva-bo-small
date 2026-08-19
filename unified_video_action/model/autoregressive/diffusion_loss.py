@@ -41,29 +41,111 @@ class DiffLoss(nn.Module):
             timestep_respacing=num_sampling_steps, noise_schedule="cosine"
         )
 
-    def forward(self, target, z, mask=None, conf_score=None, text_latents=None):
+    def predict_xstart_from_noise(self, z):
+        if z.ndim != 3:
+            raise ValueError(
+                f"Expected decoder condition [B,N,D], got {tuple(z.shape)}"
+            )
+        bsz, seq_len, _ = z.shape
+        flat_z = z.reshape(bsz * seq_len, -1)
+        prediction_timestep = self.train_diffusion.num_timesteps - 1
+        prediction_timesteps = torch.full(
+            (bsz * seq_len,),
+            prediction_timestep,
+            device=z.device,
+            dtype=torch.long,
+        )
+        fork_devices = (
+            [z.device.index]
+            if z.is_cuda and z.device.index is not None
+            else []
+        )
+        # Preserve the base objective's RNG stream across teacher ablations.
+        with torch.random.fork_rng(devices=fork_devices):
+            prediction_noise = torch.randn(
+                bsz * seq_len,
+                self.in_channels,
+                device=z.device,
+                dtype=z.dtype,
+            )
+        prediction = self.train_diffusion.p_mean_variance(
+            self.net,
+            prediction_noise,
+            prediction_timesteps,
+            clip_denoised=False,
+            model_kwargs={"c": flat_z},
+        )
+        pred_xstart = prediction["pred_xstart"].reshape(
+            bsz, seq_len, self.in_channels
+        )
+        video_prediction_timesteps = prediction_timesteps.reshape(
+            bsz, seq_len
+        )[:, 0]
+        return pred_xstart, video_prediction_timesteps
+
+    def forward(
+        self,
+        target,
+        z,
+        mask=None,
+        conf_score=None,
+        text_latents=None,
+        return_prediction=False,
+        shared_timestep=False,
+    ):
         # different noise over t and s
         bsz, seq_len, _ = target.shape
+        decoder_condition = z
         target = target.reshape(bsz * seq_len, -1)
         z = z.reshape(bsz * seq_len, -1)
-        mask = mask.reshape(bsz * seq_len)
+        if mask is not None:
+            mask = mask.reshape(bsz * seq_len)
 
-        t = torch.randint(
-            0,
-            self.train_diffusion.num_timesteps,
-            (target.shape[0],),
-            device=target.device,
-        )
+        if shared_timestep:
+            video_timesteps = torch.randint(
+                0,
+                self.train_diffusion.num_timesteps,
+                (bsz,),
+                device=target.device,
+            )
+            t = (
+                video_timesteps[:, None]
+                .expand(bsz, seq_len)
+                .reshape(bsz * seq_len)
+            )
+        else:
+            t = torch.randint(
+                0,
+                self.train_diffusion.num_timesteps,
+                (target.shape[0],),
+                device=target.device,
+            )
+            video_timesteps = None
 
         model_kwargs = dict(c=z)
         loss_dict = self.train_diffusion.training_losses(
-            self.net, target, t, model_kwargs
+            self.net,
+            target,
+            t,
+            model_kwargs,
         )
         loss = loss_dict["loss"]
 
         if mask is not None:
             loss = (loss * mask).sum() / mask.sum()
-        return loss.mean()
+        loss = loss.mean()
+        if not return_prediction:
+            return loss
+        if not shared_timestep or video_timesteps is None:
+            raise ValueError(
+                "Diffusion future-latent prediction requires one shared "
+                "timestep per video."
+            )
+
+        pred_xstart, prediction_timesteps = self.predict_xstart_from_noise(
+            decoder_condition
+        )
+        return loss, pred_xstart, prediction_timesteps
 
     def sample(self, z, temperature=1.0, cfg=1.0, text_latents=None):
         # diffusion loss sampling

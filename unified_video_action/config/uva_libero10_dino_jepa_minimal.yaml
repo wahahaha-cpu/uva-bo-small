@@ -9,6 +9,13 @@ defaults:
 
 model:
   policy:
+    # Train the existing action and video objectives together. Future MAR input
+    # tokens are fully masked; JEPA supervises the diffusion head's pred_x0.
+    selected_training_mode: full_dynamic_model
+    autoregressive_model_params:
+      predict_video: true
+      causal_future_mask: true
+      shared_video_diffusion_timestep: true
     # Disable the legacy single-teacher/VAE imitation path for this ablation.
     teacher_type: vae
     align_params:
@@ -31,9 +38,9 @@ model:
       enable_dino: true
       enable_jepa: true
       # DINO aligns absolute features; JEPA distills temporal correspondences.
-      # Keep both coefficients conservative relative to the base objective.
+      # DINO consumes tokenizer token_feat; JEPA consumes diffusion pred_x0.
       lambda_dino: 0.02
-      lambda_jepa: 0.05
+      lambda_jepa: 0.02
       projector_dim: 512
       init_seed: 4200
       required_frames: 4

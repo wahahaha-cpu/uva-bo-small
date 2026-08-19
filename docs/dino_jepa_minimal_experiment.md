@@ -1,220 +1,243 @@
-# Minimal DINOv2 + V-JEPA 2.1 Student Experiment
+# DINO Token Features + JEPA Future-Latent Experiment
 
-This experiment keeps the existing UVA/MAR objective and adds two independent
-auxiliary signals to the same Student visual tokenizer:
-
-```text
-L = L_base + lambda_dino * L_dino + lambda_jepa * L_jepa
-```
-
-The default coefficients are `lambda_dino=0.02` and `lambda_jepa=0.05`.
-DINO applies the existing hybrid token-feature primitive to absolute per-frame
-patch features. JEPA uses cross-temporal relational KL distillation: it matches
-the patch-correspondence distribution between the two temporal regions rather
-than copying absolute features or subtracting latent vectors. No adaptive gate,
-VAE alignment, MAR change, action-conditioned predictor, or temporal Transformer
-is used.
-
-## Data And Forward Flow
-
-Libero samples a 32-frame sequence. The existing `process_data` path selects
-frames `[3, 7, 11, 15, 19, 23, 27, 31]`, keeps their chronological order, and
-splits them into history/future clips of four frames each. No dataset code was
-changed.
-
-For either four-frame clip:
+This experiment gives the two frozen teachers different jobs:
 
 ```text
-RGB input                    [B, 3, 4, 256, 256]
-Student token features       [B, 4, 256, 304]
+DINOv2   -> Student tokenizer token_feat (per-frame spatial semantics)
+V-JEPA2  -> video diffusion pred_x0 (future temporal correspondence)
 ```
 
-DINOv2 receives the four frames as independent images after its normal resize
-and ImageNet normalization:
+It uses the existing UVA/MAR action and video objectives:
 
 ```text
-DINO tokens                  [B, 4, 256, 384]
-student_to_dino_projector    [B, 4, 256, 384]
+L_base = L_video_diffusion + L_action
+L      = L_base + lambda_dino * L_dino + lambda_jepa * L_jepa
 ```
 
-V-JEPA receives the complete clip exactly once:
+The default coefficients are `lambda_dino=0.02` and `lambda_jepa=0.02`.
+There is no JEPA loss on tokenizer token features and no absolute JEPA feature
+imitation.
+
+## Forward Flow
+
+The existing Libero data path selects frames
+`[3, 7, 11, 15, 19, 23, 27, 31]` from each 32-frame sample, preserves their
+order, and splits them into history and future clips:
 
 ```text
-JEPA input                   [B, 3, 4, 384, 384]
-tubelet_size                 2 (kept at the pretrained setting)
-patch projection             [B, 768, 2, 24, 24]
-raw encoder output           [B, 1152, 768]
-explicit temporal tokens    [B, 2, 576, 768]
-J01, J23                    [B, 576, 768]
-R_jepa = J23 @ J01^T        [B, 576, 576]
-P_jepa = softmax(R_jepa/tau) [B, 576, 576]
+history RGB                         [B, 3, 4, 256, 256]
+future RGB                          [B, 3, 4, 256, 256]
 ```
 
-The reshape is derived from an actual forward hook on the encoder's Conv3d
-patch projection. `PatchEmbed3D` flattens the `[T, H, W]` output in temporal,
-height, width order; the implementation validates that the flattened token
-count agrees with the captured projection shape. It never treats `T*H*W` as a
-single square image grid.
+### DINO Spatial Branch
 
-Student temporal regions use one shared ordered-pair MLP and one shared JEPA
-projector:
+DINO behavior remains the same as the previous token-feature experiment. Both
+four-frame clips are supervised independently and their losses are averaged:
 
 ```text
-H01 = F([S0, S1, S1-S0])
-H23 = F([S2, S3, S3-S2])
-Q01 = P_J(H01)                              [B, 256, 768]
-Q23 = P_J(H23)                              [B, 256, 768]
-spatial interpolation only                 [B, 576, 768]
-R_student = Q23 @ Q01^T                     [B, 576, 576]
-P_student = softmax(R_student/tau)          [B, 576, 576]
+Student tokenizer token_feat       [B, 4, 256, 304]
+DINO patch tokens                   [B, 4, 256, 384]
+student_to_dino_projector           [B, 4, 256, 384]
+L_dino                              hybrid(cosine, MSE, feature statistics)
 ```
 
-All patch features are L2-normalized before the matrix multiplication. The JEPA
-loss is a row-wise cross-temporal correspondence distillation objective:
+DINO therefore continues to shape what each frame sees. It does not supervise
+the video diffusion output.
+
+### Causal Video-Diffusion Branch
+
+The experiment uses `selected_training_mode=full_dynamic_model`, so the
+existing video and action losses are both active. The four future MAR input
+frames are fully masked before the encoder. The decoder condition therefore
+depends on history but not on clean future tokens:
 
 ```text
-R_jepa[b,i,j]     = cos(J23[b,i], J01[b,j])
-P_jepa[b,i,:]     = softmax(R_jepa[b,i,:] / tau)
-L_jepa            = KL(P_jepa || P_student)
+history Student latent              [B, 4, 16, 16, 16]
+future Student latent target        [B, 4, 16, 16, 16]
+future MAR mask                     [B, 4, 256] = all ones
+MAR decoder condition               [B, 1024, 768]
 ```
 
-The implementation uses `F.kl_div(log_P_student, P_jepa.detach(),
-reduction="batchmean")`, exactly preserving the teacher-to-student direction.
-`jepa_relation_temperature` defaults to `0.1` and is independent of
-`lambda_jepa`.
+The base video diffusion loss remains standard: it noises the detached future
+latent target to `x_t` and predicts epsilon. One shared training timestep is
+used for every patch in a video.
 
-## Changed Files
+The JEPA branch makes one additional differentiable diffusion-head call. It
+starts from independent Gaussian noise at the highest training timestep
+`t=999`, conditioned on the history-derived MAR decoder tokens, and converts
+the predicted epsilon into `pred_x0`:
 
-| File | Change |
-| --- | --- |
-| `unified_video_action/model/common/jepa_teacher.py` | Removes duplicate-frame clips; performs one real video forward, captures patch-grid shape, restores `[B,T,N,D]`, keeps teacher frozen/eval, and recovers stale torch-hub locks. |
-| `unified_video_action/model/common/temporal_fusion.py` | Adds the small shared ordered-pair `TemporalFusionMLP`. |
-| `unified_video_action/policy/unified_video_action_policy.py` | Adds independent DINO spatial and JEPA relational branches, spatial-only resampling, auxiliary coefficients, optimizer/EMA/DDP registration, first-forward relation/probability logging, and legacy JEPA compatibility mapping. |
-| `unified_video_action/model/common/dinov2_teacher.py` | Ensures the frozen DINO wrapper remains eval when the parent policy enters train mode. |
-| `scripts/verify_dino_jepa_minimal.py` | Real Libero one-batch forward/backward, component gradient norms, frozen-teacher checks, optimizer membership, EMA state-dict check, and temporal-order sanity checks. |
-| `scripts/training/train_uva_libero10_dino_jepa_minimal_8gpu.sh` | Selectable baseline/DINO/JEPA/combined launcher with checkpoint preflight, global-batch checks, optional sanity check, and dry-run mode. |
-| `unified_video_action/config/uva_libero10_dino_jepa_minimal*.yaml` | Baseline, DINO-only, JEPA-only, and DINO+JEPA ablations. Legacy alignment is disabled in all four. |
+```text
+video DiffLoss pred_x0              [B, 4, 256, 16]
+```
 
-Teacher construction, auxiliary module construction, and teacher forward are
-RNG-isolated. This keeps Student/MAR initialization and stochastic base-loss
-sampling identical across ablations; corresponding projectors use fixed
-sub-seeds.
+This prediction does not consume the clean or noised future target. It is one
+extra diffusion-head forward, but not the final result of the
+non-differentiable 100-step sampling loop. The auxiliary noise generation is
+RNG-isolated so action/video base losses remain identical across ablations.
 
-## Ablations
+### V-JEPA Future Target
+
+Only the real future four-frame clip enters frozen V-JEPA 2.1:
+
+```text
+V-JEPA input                        [B, 3, 4, 384, 384]
+tubelet_size                        2
+patch projection                    [B, 768, 2, 24, 24]
+raw encoder output                  [B, 1152, 768]
+explicit temporal tokens            [B, 2, 576, 768]
+J01, J23                            [B, 576, 768]
+```
+
+The temporal reshape comes from the real Conv3d patch projection. The encoder
+sequence order is validated as temporal, height, width; `T*H*W` is never treated
+as one square spatial grid.
+
+### Relational KL
+
+The diffusion future latents, rather than tokenizer features, enter the shared
+ordered-pair fusion and JEPA projector:
+
+```text
+H01 = F([pred_x0_0, pred_x0_1, pred_x0_1 - pred_x0_0]) [B, 256, 16]
+H23 = F([pred_x0_2, pred_x0_3, pred_x0_3 - pred_x0_2]) [B, 256, 16]
+Q01, Q23 = P_J(H01), P_J(H23)                          [B, 256, 768]
+spatial-only interpolation                            [B, 576, 768]
+```
+
+After L2 normalization:
+
+```text
+R_jepa    = J23 @ J01^T              [B, 576, 576]
+R_student = Q23 @ Q01^T              [B, 576, 576]
+P_jepa    = softmax(R_jepa / tau)
+log_P_s   = log_softmax(R_student / tau)
+```
+
+The loss direction remains teacher to student:
+
+```text
+raw_kl = F.kl_div(log_P_s, P_jepa.detach(), reduction="batchmean")
+L_jepa = raw_kl / number_of_query_patches
+```
+
+The row normalization is necessary because PyTorch `batchmean` sums all 576
+query rows and divides only by `B`. Averaging the rows makes the auxiliary scale
+independent of JEPA spatial resolution. `tau=0.1`.
+
+## Causality Contract
+
+The verifier checks the actual computation graph:
+
+```text
+||d decoder_condition / d clean_future_input|| = 0
+||d decoder_condition / d history_input||       > 0
+||d pure_noise_pred_x0 / d clean_future_input|| = 0
+||d pure_noise_pred_x0 / d history_input||       > 0
+```
+
+This establishes history-to-future conditioning without clean future-token
+leakage through the MAR encoder/decoder. It does not make the bidirectional MAR
+decoder autoregressive within the four predicted future frames; those frames
+are modeled jointly. It also does not add action-conditioned world modeling:
+the existing `full_dynamic_model` path uses the MAR history condition for video
+prediction and trains the existing action loss alongside it.
+
+## Configuration And Ablations
+
+All four configurations share the same full-dynamics base objective, causal
+future mask, and one-timestep-per-video diffusion sampling:
 
 ```bash
-# Baseline
+# Base video + action training
 bash scripts/training/train_uva_libero10_dino_jepa_minimal_8gpu.sh baseline
 
-# DINO spatial supervision only
+# Base + DINO token-feature hybrid alignment
 bash scripts/training/train_uva_libero10_dino_jepa_minimal_8gpu.sh dino
 
-# V-JEPA temporal-dynamics supervision only
+# Base + JEPA future-latent relational KL
 bash scripts/training/train_uva_libero10_dino_jepa_minimal_8gpu.sh jepa
 
-# Both complementary signals
+# Base + both complementary teachers
 bash scripts/training/train_uva_libero10_dino_jepa_minimal_8gpu.sh dino_jepa
 ```
 
 The launcher defaults to `8 GPU x 16 samples x accumulation 1 = global batch
-128`, matching the existing eight-GPU experiment. Set `RUN_SANITY_CHECK=0` to
-skip the one-real-batch preflight, or `DRY_RUN=1` to print the exact command.
+128`. It runs a real-batch sanity check unless `RUN_SANITY_CHECK=0` is set.
 
-## Real One-Batch Results
+## Real One-Batch Result
 
-Command:
-
-```bash
-CUDA_VISIBLE_DEVICES=3 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
-  /data1/local_userdata/jinboning/conda/envs/repa/bin/python3.9 \
-  scripts/verify_dino_jepa_minimal.py \
-  --config-name uva_libero10_dino_jepa_minimal --device cuda --check-ema
-```
-
-Observed combined loss values on the first real Libero sample:
+Observed with the combined configuration:
 
 ```text
-base_loss       = 0.94105399
-dino_loss       = 5.16265297
-jepa_loss       = 263.68664551
-weighted_dino   = 0.10325306
-weighted_jepa   = 13.18433285
-total_loss      = 14.22863960
+video_loss                         0.08798663
+action_loss                        0.98115909
+base_loss                          1.06914568
+dino_loss                          5.16265297
+jepa_loss (query-row mean)         0.66032153
+weighted_dino                      0.10325306
+weighted_jepa                      0.01320643
+total_loss                         1.18560517
 ```
 
-The requested `reduction="batchmean"` is applied directly to the `[B,N,N]`
-relation tensor. PyTorch divides by `B`, not by the `N` correspondence rows,
-so this loss is intentionally on the order of `N` times a per-row KL. The
-resulting scale and gradient are logged explicitly before a long run.
+The same first-batch `base_loss=1.06914568` is observed for baseline,
+DINO-only, JEPA-only, and combined runs.
 
-Component gradient norms on Student (before the total backward):
+Probability checks:
 
 ```text
-grad_norm_base  = 0.00000000
-grad_norm_dino  = 0.09952239
-grad_norm_jepa  = 68.56994629
+teacher row-sum max error          2.38e-07
+student row-sum max error          3.58e-07
+teacher probability range          [3.28e-05, 7.997e-02]
+student probability range          [5.47e-06, 4.011e-02]
+teacher entropy                     5.88014221
+student entropy                     6.09472132
 ```
 
-The DINO hybrid token metrics for the same batch were:
+Component gradients into the Student tokenizer:
 
 ```text
-dino_cos              = -0.01092050
-dino_mse              = 5.48106527
-dino_stats            = 5.46393538
+base                               5.46489286
+weighted DINO                      0.09952239
+weighted JEPA                      0.80731905
 ```
 
-The relational JEPA metrics were:
+The base and JEPA gradient norms into the video diffusion head are
+`0.75568020` and `1.48714137`, respectively. After the
+combined backward, every trainable tensor in the Student tokenizer, video
+diffusion head, DINO projector, TemporalFusionMLP, and JEPA projector has a
+finite gradient. Both teachers remain in eval mode with zero trainable tensors
+and zero gradients.
+
+Causality and temporal checks:
 
 ```text
-jepa_kl                           = 263.68664551
-jepa_teacher_row_sum_max_error   = 2.38e-07
-jepa_student_row_sum_max_error   = 3.87e-07
-jepa_teacher_probability_min     = 3.877e-05
-jepa_teacher_probability_max     = 7.785e-02
-jepa_teacher_entropy             = 5.88615131
-jepa_student_entropy             = 6.35563135
+future mask fraction                         1.0
+decoder gradient wrt clean future input      0.0
+decoder gradient wrt history input           1.3041e-05
+TemporalFusion forward/swap mean difference  0.16584623
+JEPA forward/reverse probability difference  0.00055178
 ```
 
-The zero first-batch base-to-Student norm is expected for the existing
-video-only MAR checkpoint: its randomly initialized action diffusion head has
-a zero-initialized final output layer. The base loss still trains the MAR/action
-parameters; after that head updates, its conditioning path can contribute to
-Student gradients. The auxiliary branches provide the initial Student signal.
+## Changed Files
 
-After `total_loss.backward()`:
+| File | Role |
+| --- | --- |
+| `unified_video_action/model/autoregressive/diffusion_loss.py` | Adds the pure-noise differentiable `pred_x0` branch and one shared timestep per video. |
+| `unified_video_action/model/autoregressive/mar_con_unified.py` | Applies the full future mask and returns video diffusion future-latent metadata. |
+| `unified_video_action/policy/unified_video_action_policy.py` | Keeps DINO on token features and moves JEPA relational KL to diffusion `pred_x0`. |
+| `unified_video_action/config/uva_libero10_dino_jepa_minimal*.yaml` | Defines common base behavior and four ablations. |
+| `scripts/verify_dino_jepa_minimal.py` | Checks shapes, losses, optimizer/EMA state, gradients, frozen teachers, relations, and causal leakage. |
+| `scripts/training/train_uva_libero10_dino_jepa_minimal_8gpu.sh` | Launches baseline, DINO-only, JEPA-only, or combined on eight GPUs. |
 
-```text
-Student tokenizer             gradient norm 68.57412836, finite
-DINO projector                gradient norm 0.02491881, finite
-TemporalFusionMLP             gradient norm 7.25536751, finite
-JEPA projector                gradient norm 2.57324442, finite
-DINO teacher                  0 trainable tensors, 0 gradient tensors, eval
-V-JEPA teacher                0 trainable tensors, 0 gradient tensors, eval
-```
-
-Temporal/relation checks:
-
-```text
-TemporalFusion(S0,S1) vs TemporalFusion(S1,S0): mean abs diff 0.00613579
-JEPA relation forward vs reversed clip:            mean abs diff 0.00051177
-JEPA relation forward/reversed cosine:                      0.99659026
-JEPA teacher entropy:                                      5.88615131
-JEPA student entropy:                                      6.35563135
-```
-
-Baseline, DINO-only, JEPA-only, and combined configurations all pass the same
-finite-loss/gradient contract. DINO-only and combined share the same first-batch
-DINO loss (`5.16265297`) and base loss (`0.94105399`), confirming the ablation
-RNG isolation.
-
-## Verification Status
+## Verification
 
 Passed:
 
-1. Python 3.9 and 3.12 compilation for all changed Python files.
-2. `bash -n` for the launcher and dry-run command generation for all four modes.
-3. Real V-JEPA output/shape validation with `tubelet_size=2` and four frames.
-4. Real Libero one-batch forward, finite losses, backward, module gradients, and frozen-teacher checks for all ablations.
-5. EMA deep-copy and strict policy state-dict load check for the combined policy.
-6. Cross-temporal relation matrices and probability row sums on a real batch.
-7. Existing `uva_libero10_jepa2_1_small_token_feat` one-batch compatibility smoke test after removing duplicate-frame JEPA input.
+1. Python compilation and `git diff --check`.
+2. Real V-JEPA four-frame shape recovery with `tubelet_size=2`.
+3. Real Libero forward/backward for all four ablations.
+4. Identical base loss across all four first-batch ablations.
+5. Finite gradients into the intended Student, MAR, diffusion, and projector modules.
+6. Frozen/eval teachers excluded from the optimizer.
+7. Probability row sums, temporal-order sensitivity, full-mask, and causal-gradient checks.
