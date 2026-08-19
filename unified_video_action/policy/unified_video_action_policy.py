@@ -170,14 +170,8 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
         self.dino_stats_coeff = float(
             self.dual_teacher_params.get("dino_stats_coeff", 0.1)
         )
-        self.jepa_loss_type = str(
-            self.dual_teacher_params.get("jepa_loss_type", "hybrid")
-        ).lower()
-        self.jepa_mse_coeff = float(
-            self.dual_teacher_params.get("jepa_mse_coeff", 0.25)
-        )
-        self.jepa_stats_coeff = float(
-            self.dual_teacher_params.get("jepa_stats_coeff", 0.1)
+        self.jepa_relation_temperature = float(
+            self.dual_teacher_params.get("jepa_relation_temperature", 0.1)
         )
         self.log_dual_teacher_shapes = bool(
             self.dual_teacher_params.get("log_shapes_once", True)
@@ -220,6 +214,8 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
                 )
             if self.lambda_dino < 0.0 or self.lambda_jepa < 0.0:
                 raise ValueError("Teacher loss coefficients must be non-negative.")
+            if self.enable_jepa_dynamics and self.jepa_relation_temperature <= 0.0:
+                raise ValueError("jepa_relation_temperature must be positive.")
 
         # Student alignment consumes RGB directly, but video generation and FVD
         # still encode/decode through the VAE even for JEPA/DINO teachers.
@@ -932,7 +928,7 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
         )
         return dino_loss, metrics, teacher_tokens, projected_student
 
-    def _compute_student_dynamics(self, student_tokens: torch.Tensor):
+    def _compute_student_temporal_regions(self, student_tokens: torch.Tensor):
         if student_tokens.ndim != 4:
             raise ValueError(
                 f"Expected Student tokens [B,T,N,D], got {tuple(student_tokens.shape)}"
@@ -945,8 +941,8 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
         s0, s1, s2, s3 = student_tokens.unbind(dim=1)
         h01 = self.temporal_fusion(s0, s1)
         h23 = self.temporal_fusion(s2, s3)
-        delta_student = h23 - h01
-        projected_delta_student = self.student_to_jepa_projector(delta_student)
+        q01 = self.student_to_jepa_projector(h01)
+        q23 = self.student_to_jepa_projector(h23)
         return {
             "s0": s0,
             "s1": s1,
@@ -954,12 +950,31 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
             "s3": s3,
             "h01": h01,
             "h23": h23,
-            "delta_student": delta_student,
-            "projected_delta_student": projected_delta_student,
+            "q01": q01,
+            "q23": q23,
         }
 
+    @staticmethod
+    def _cross_temporal_relation_logits(
+        earlier_tokens: torch.Tensor, later_tokens: torch.Tensor
+    ) -> torch.Tensor:
+        # 只构造跨时间 patch 对应关系，不把冻结 teacher 的绝对特征直接回传给 Student。
+        if earlier_tokens.ndim != 3 or later_tokens.ndim != 3:
+            raise ValueError(
+                "Cross-temporal relations expect [B,N,D] tokens, got "
+                f"{tuple(earlier_tokens.shape)} and {tuple(later_tokens.shape)}"
+            )
+        if earlier_tokens.shape != later_tokens.shape:
+            raise ValueError(
+                "Earlier/later token shapes must match, got "
+                f"{tuple(earlier_tokens.shape)} and {tuple(later_tokens.shape)}"
+            )
+        earlier_tokens = F.normalize(earlier_tokens.float(), p=2, dim=-1)
+        later_tokens = F.normalize(later_tokens.float(), p=2, dim=-1)
+        return torch.matmul(later_tokens, earlier_tokens.transpose(-1, -2))
+
     @torch.no_grad()
-    def _extract_jepa_dynamics_target(
+    def _extract_jepa_relational_target(
         self, video: torch.Tensor, return_metadata: bool = False
     ):
         with _isolated_rng(preserve_cuda=True):
@@ -978,7 +993,11 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
             )
         j01 = teacher_tokens[:, 0]
         j23 = teacher_tokens[:, 1]
-        return j23 - j01, teacher_tokens, metadata
+        relation_logits = self._cross_temporal_relation_logits(j01, j23)
+        probabilities = F.softmax(
+            relation_logits / self.jepa_relation_temperature, dim=-1
+        )
+        return probabilities, relation_logits, teacher_tokens, metadata
 
     def _compute_jepa_dynamics_alignment(
         self,
@@ -986,37 +1005,78 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
         student_tokens: torch.Tensor,
         return_metadata: bool = False,
     ):
-        delta_jepa, teacher_tokens, metadata = self._extract_jepa_dynamics_target(
-            video, return_metadata=return_metadata
+        (
+            teacher_probabilities,
+            teacher_relations,
+            teacher_tokens,
+            metadata,
+        ) = self._extract_jepa_relational_target(video, return_metadata=return_metadata)
+        temporal_regions = self._compute_student_temporal_regions(student_tokens)
+        q01 = self._resample_spatial_tokens(
+            temporal_regions["q01"],
+            target_token_count=teacher_tokens.shape[2],
         )
-        dynamics = self._compute_student_dynamics(student_tokens)
-        projected_delta_student = self._resample_spatial_tokens(
-            dynamics["projected_delta_student"],
-            target_token_count=delta_jepa.shape[1],
+        q23 = self._resample_spatial_tokens(
+            temporal_regions["q23"],
+            target_token_count=teacher_tokens.shape[2],
         )
-        dynamics["projected_delta_student"] = projected_delta_student
+        student_relations = self._cross_temporal_relation_logits(q01, q23)
+        student_log_probabilities = F.log_softmax(
+            student_relations / self.jepa_relation_temperature, dim=-1
+        )
+        jepa_loss = F.kl_div(
+            student_log_probabilities,
+            teacher_probabilities.detach(),
+            reduction="batchmean",
+        )
 
-        jepa_loss, alignment_metrics = self._compute_feature_alignment_loss(
-            projected_delta_student,
-            delta_jepa.detach(),
-            loss_type=self.jepa_loss_type,
-            mse_coeff=self.jepa_mse_coeff,
-            stats_coeff=self.jepa_stats_coeff,
-        )
+        student_probabilities = student_log_probabilities.exp()
+        teacher_row_sums = teacher_probabilities.sum(dim=-1)
+        student_row_sums = student_probabilities.sum(dim=-1)
+        teacher_entropy = -(
+            teacher_probabilities
+            * teacher_probabilities.clamp_min(torch.finfo(torch.float32).tiny).log()
+        ).sum(dim=-1).mean()
+        student_entropy = -(
+            student_probabilities * student_log_probabilities
+        ).sum(dim=-1).mean()
         metrics = {
-            "cosine": alignment_metrics["cosine"],
-            "mse": alignment_metrics["mse"],
-            "stats": alignment_metrics["stats"],
-            "student_dynamics_norm": projected_delta_student.detach()
-            .float()
-            .norm(dim=-1)
-            .mean(),
-            "teacher_dynamics_norm": delta_jepa.detach()
-            .float()
-            .norm(dim=-1)
-            .mean(),
+            "kl": jepa_loss.detach(),
+            "teacher_row_sum_mean": teacher_row_sums.detach().mean(),
+            "teacher_row_sum_max_error": teacher_row_sums.detach()
+            .sub(1.0)
+            .abs()
+            .max(),
+            "student_row_sum_mean": student_row_sums.detach().mean(),
+            "student_row_sum_max_error": student_row_sums.detach()
+            .sub(1.0)
+            .abs()
+            .max(),
+            "teacher_probability_min": teacher_probabilities.detach().min(),
+            "teacher_probability_max": teacher_probabilities.detach().max(),
+            "student_probability_min": student_probabilities.detach().min(),
+            "student_probability_max": student_probabilities.detach().max(),
+            "teacher_entropy": teacher_entropy.detach(),
+            "student_entropy": student_entropy.detach(),
         }
-        return jepa_loss, metrics, teacher_tokens, delta_jepa, dynamics, metadata
+        temporal_regions.update(
+            {
+                "q01": q01,
+                "q23": q23,
+                "student_relations": student_relations,
+                "student_log_probabilities": student_log_probabilities,
+                "student_probabilities": student_probabilities,
+            }
+        )
+        return (
+            jepa_loss,
+            metrics,
+            teacher_tokens,
+            teacher_relations,
+            teacher_probabilities,
+            temporal_regions,
+            metadata,
+        )
 
     def _compute_dual_teacher_clip_losses(
         self,
@@ -1063,23 +1123,16 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
                 jepa_loss,
                 jepa_metrics,
                 jepa_tokens,
-                delta_jepa,
-                dynamics,
+                teacher_relations,
+                teacher_probabilities,
+                temporal_regions,
                 jepa_metadata,
             ) = self._compute_jepa_dynamics_alignment(
                 video, student_tokens, return_metadata=capture_shapes
             )
             metrics.update(
                 {
-                    "jepa_dynamics_cos": jepa_metrics["cosine"],
-                    "jepa_dynamics_mse": jepa_metrics["mse"],
-                    "jepa_dynamics_stats": jepa_metrics["stats"],
-                    "jepa_student_dynamics_norm": jepa_metrics[
-                        "student_dynamics_norm"
-                    ],
-                    "jepa_teacher_dynamics_norm": jepa_metrics[
-                        "teacher_dynamics_norm"
-                    ],
+                    f"jepa_{key}": value for key, value in jepa_metrics.items()
                 }
             )
             if capture_shapes:
@@ -1091,17 +1144,22 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
                         "reshaped_jepa": tuple(jepa_tokens.shape),
                         "j01": tuple(jepa_tokens[:, 0].shape),
                         "j23": tuple(jepa_tokens[:, 1].shape),
-                        "delta_jepa": tuple(delta_jepa.shape),
-                        "s0": tuple(dynamics["s0"].shape),
-                        "s1": tuple(dynamics["s1"].shape),
-                        "s2": tuple(dynamics["s2"].shape),
-                        "s3": tuple(dynamics["s3"].shape),
-                        "h01": tuple(dynamics["h01"].shape),
-                        "h23": tuple(dynamics["h23"].shape),
-                        "delta_student": tuple(dynamics["delta_student"].shape),
-                        "projected_delta_student": tuple(
-                            dynamics["projected_delta_student"].shape
+                        "q01": tuple(temporal_regions["q01"].shape),
+                        "q23": tuple(temporal_regions["q23"].shape),
+                        "r_jepa": tuple(teacher_relations.shape),
+                        "p_jepa": tuple(teacher_probabilities.shape),
+                        "r_student": tuple(
+                            temporal_regions["student_relations"].shape
                         ),
+                        "p_student": tuple(
+                            temporal_regions["student_probabilities"].shape
+                        ),
+                        "s0": tuple(temporal_regions["s0"].shape),
+                        "s1": tuple(temporal_regions["s1"].shape),
+                        "s2": tuple(temporal_regions["s2"].shape),
+                        "s3": tuple(temporal_regions["s3"].shape),
+                        "h01": tuple(temporal_regions["h01"].shape),
+                        "h23": tuple(temporal_regions["h23"].shape),
                     }
                 )
         return dino_loss, jepa_loss, metrics, shapes
@@ -1166,15 +1224,18 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
             "reshaped_jepa",
             "j01",
             "j23",
-            "delta_jepa",
             "s0",
             "s1",
             "s2",
             "s3",
             "h01",
             "h23",
-            "delta_student",
-            "projected_delta_student",
+            "q01",
+            "q23",
+            "r_jepa",
+            "r_student",
+            "p_jepa",
+            "p_student",
         ):
             if label in shapes:
                 print(f"{label}: {shapes[label]}", flush=True)
@@ -1191,9 +1252,17 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
                 "dino_cos",
                 "dino_mse",
                 "dino_stats",
-                "jepa_dynamics_cos",
-                "jepa_dynamics_mse",
-                "jepa_dynamics_stats",
+                "jepa_kl",
+                "jepa_teacher_row_sum_mean",
+                "jepa_teacher_row_sum_max_error",
+                "jepa_teacher_probability_min",
+                "jepa_teacher_probability_max",
+                "jepa_student_row_sum_mean",
+                "jepa_student_row_sum_max_error",
+                "jepa_student_probability_min",
+                "jepa_student_probability_max",
+                "jepa_teacher_entropy",
+                "jepa_student_entropy",
             )
             logged_metrics = {
                 name: alignment_metrics[name].detach().float().item()

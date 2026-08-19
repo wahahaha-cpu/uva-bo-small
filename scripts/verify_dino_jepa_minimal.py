@@ -176,14 +176,27 @@ def main() -> None:
         "dino_cos",
         "dino_mse",
         "dino_stats",
-        "jepa_dynamics_cos",
-        "jepa_dynamics_mse",
-        "jepa_dynamics_stats",
+        "jepa_kl",
+        "jepa_teacher_row_sum_mean",
+        "jepa_teacher_row_sum_max_error",
+        "jepa_student_row_sum_mean",
+        "jepa_student_row_sum_max_error",
+        "jepa_teacher_probability_min",
+        "jepa_teacher_probability_max",
+        "jepa_student_probability_min",
+        "jepa_student_probability_max",
+        "jepa_teacher_entropy",
+        "jepa_student_entropy",
     ):
         value = policy._last_align_metrics.get(key)
         if value is not None:
             assert torch.isfinite(value).all(), f"Non-finite {key}: {value}"
             alignment_metrics[key] = value.detach().float().item()
+    if policy.jepa_teacher is not None:
+        assert abs(alignment_metrics["jepa_teacher_row_sum_mean"] - 1.0) < 1e-5
+        assert alignment_metrics["jepa_teacher_row_sum_max_error"] < 1e-5
+        assert abs(alignment_metrics["jepa_student_row_sum_mean"] - 1.0) < 1e-5
+        assert alignment_metrics["jepa_student_row_sum_max_error"] < 1e-5
 
     student_parameters = tuple(policy.student_tokenizer.parameters())
     component_gradient_norms = {
@@ -268,21 +281,39 @@ def main() -> None:
         )
 
         with torch.no_grad():
-            delta_forward, _, _ = policy._extract_jepa_dynamics_target(
+            (
+                probability_forward,
+                relation_forward,
+                teacher_tokens,
+                metadata,
+            ) = policy._extract_jepa_relational_target(
                 history_clip, return_metadata=True
             )
-            delta_reverse, _, _ = policy._extract_jepa_dynamics_target(
-                history_clip.flip(2), return_metadata=True
+            probability_reverse, relation_reverse, _, _ = (
+                policy._extract_jepa_relational_target(
+                    history_clip.flip(2), return_metadata=True
+                )
             )
-            jepa_reverse_difference = (delta_forward - delta_reverse).abs().mean()
+            assert teacher_tokens.shape == (1, 2, 576, 768)
+            assert relation_forward.shape == probability_forward.shape == (1, 576, 576)
+            assert torch.allclose(
+                probability_forward.sum(dim=-1),
+                torch.ones_like(probability_forward[..., 0]),
+                atol=1e-5,
+                rtol=1e-5,
+            )
+            jepa_reverse_difference = (
+                probability_forward - probability_reverse
+            ).abs().mean()
             jepa_reverse_cosine = torch.nn.functional.cosine_similarity(
-                delta_forward.flatten(1), delta_reverse.flatten(1), dim=-1
+                relation_forward.flatten(1), relation_reverse.flatten(1), dim=-1
             ).mean()
         assert jepa_reverse_difference.item() > 1e-7
-        temporal_metrics["jepa_reverse_mean_abs_diff"] = (
+        temporal_metrics["jepa_relation_reverse_mean_abs_diff"] = (
             jepa_reverse_difference.item()
         )
-        temporal_metrics["jepa_reverse_cosine"] = jepa_reverse_cosine.item()
+        temporal_metrics["jepa_relation_reverse_cosine"] = jepa_reverse_cosine.item()
+        temporal_metrics["jepa_patch_embed_shape"] = metadata["patch_embed_shape"]
 
     print("--- one-real-batch verification ---")
     print(f"config: {args.config_name}")

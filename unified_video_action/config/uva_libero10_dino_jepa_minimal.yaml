@@ -30,8 +30,8 @@ model:
       enable: true
       enable_dino: true
       enable_jepa: true
-      # Both auxiliary branches use the same hybrid token-feature primitive;
-      # keep their coefficients conservative relative to the base objective.
+      # DINO aligns absolute features; JEPA distills temporal correspondences.
+      # Keep both coefficients conservative relative to the base objective.
       lambda_dino: 0.02
       lambda_jepa: 0.05
       projector_dim: 512
@@ -40,9 +40,7 @@ model:
       dino_loss_type: hybrid
       dino_mse_coeff: 0.25
       dino_stats_coeff: 0.1
-      jepa_loss_type: hybrid
-      jepa_mse_coeff: 0.25
-      jepa_stats_coeff: 0.1
+      jepa_relation_temperature: 0.1
       log_shapes_once: true
 
 training:
