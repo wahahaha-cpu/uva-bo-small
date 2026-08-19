@@ -958,7 +958,7 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
     def _cross_temporal_relation_logits(
         earlier_tokens: torch.Tensor, later_tokens: torch.Tensor
     ) -> torch.Tensor:
-        # 只构造跨时间 patch 对应关系，不把冻结 teacher 的绝对特征直接回传给 Student。
+        # Match cross-temporal patch relations instead of absolute teacher features.
         if earlier_tokens.ndim != 3 or later_tokens.ndim != 3:
             raise ValueError(
                 "Cross-temporal relations expect [B,N,D] tokens, got "
