@@ -15,6 +15,7 @@ model:
       model_img_size: 518
       checkpoint_path: pretrained_models/dinov2/dinov2_vits14_pretrain.pth
       loader: timm
+      feature_layer: final
     align_params:
       align_on: token_feat
       use_projector: true

@@ -1,0 +1,5 @@
+benchmark_root: "@LIBERO_PLUS_ROOT@/libero/libero"
+bddl_files: "@LIBERO_PLUS_ROOT@/libero/libero/bddl_files"
+init_states: "@LIBERO_PLUS_ROOT@/libero/libero/init_files"
+datasets: "@LIBERO_PLUS_ROOT@/libero/datasets"
+assets: "@LIBERO_PLUS_ROOT@/libero/libero/assets"

@@ -1,0 +1,41 @@
+# DINOv2 patch supervision with the MAR KL-VAE encoder replacing the
+# lightweight Transformer tokenizer. DINOv2 sees the VAE encoder's final
+# 16x16 feature map; MAR still receives the 16-channel KL latent.
+name: uva_libero10_dinov2_trainable_vae_video_pretrained_conv_fc_action
+
+defaults:
+  - uva_libero10_dinov2_small_token_feat_video_pretrained_conv_fc_action
+  - _self_
+
+model:
+  policy:
+    use_student_tokenizer: true
+    student_tokenizer_backend: vae
+    student_tokenizer_params: null
+    vae_student_mode: sample
+    vae_student_feature: encoder
+    vae_encoder_lr_scale: 1.0
+    # Keep the final DINO block as the baseline; the shallow ablation overrides
+    # this to ``shallow`` (the fourth ViT block for ViT-S/14).
+    dinov2_teacher_params:
+      feature_layer: final
+    freeze_mar: false
+    align_params:
+      align_on: token_feat
+      use_projector: true
+
+training:
+  resume: false
+
+logging:
+  project: uva-repa-dinov2
+  name: train_uva_libero10_dinov2_trainable_vae_video_pretrained_conv_fc_action
+  tags:
+    - train_uva_libero10_dinov2_trainable_vae
+    - libero10
+    - dinov2_vits14_teacher
+    - trainable_vae_encoder_features
+    - frozen_vae_decoder
+    - video_pretrained_mar
+    - full_mar_finetune
+    - conv_fc

@@ -27,6 +27,7 @@ class StudentLatentTokenizer(nn.Module):
         dropout=0.0,
         use_temporal_mixer=True,
         temporal_kernel_size=3,
+        early_patchify=False,
     ):
         super().__init__()
         assert img_size % patch_size == 0, "image size must be divisible by patch size"
@@ -40,16 +41,34 @@ class StudentLatentTokenizer(nn.Module):
         self.grid_size = img_size // patch_size
         self.num_patches = self.grid_size * self.grid_size
         self.use_temporal_mixer = use_temporal_mixer
+        self.early_patchify = bool(early_patchify)
 
-        # Slightly stronger visual stem than a raw patch projection.
-        self.stem = nn.Sequential(
-            nn.Conv2d(in_channels, hidden_dim // 2, kernel_size=3, stride=1, padding=1),
-            nn.GELU(),
-            nn.Conv2d(hidden_dim // 2, hidden_dim // 2, kernel_size=3, stride=1, padding=1),
-            nn.GELU(),
-        )
+        if self.early_patchify:
+            # Avoid retaining full-resolution feature maps during backward.
+            self.stem = nn.Sequential()
+            patch_in_channels = in_channels
+        else:
+            self.stem = nn.Sequential(
+                nn.Conv2d(
+                    in_channels,
+                    hidden_dim // 2,
+                    kernel_size=3,
+                    stride=1,
+                    padding=1,
+                ),
+                nn.GELU(),
+                nn.Conv2d(
+                    hidden_dim // 2,
+                    hidden_dim // 2,
+                    kernel_size=3,
+                    stride=1,
+                    padding=1,
+                ),
+                nn.GELU(),
+            )
+            patch_in_channels = hidden_dim // 2
         self.patch_embed = nn.Conv2d(
-            hidden_dim // 2,
+            patch_in_channels,
             hidden_dim,
             kernel_size=patch_size,
             stride=patch_size,

@@ -1,0 +1,88 @@
+# UMI policy-only fine-tuning with a trainable MAR KL-VAE encoder and frozen
+# shallow DINOv2 supervision. The VAE decoder remains frozen because it is not
+# part of the train-time encoding/alignment path.
+name: uva_umi_dinov2_trainable_vae_shallow_policy
+
+defaults:
+  - uva_umi_multi
+  - _self_
+
+model:
+  policy:
+    selected_training_mode: policy_model
+    action_model_params:
+      predict_action: true
+      act_model_type: conv_fc
+
+    # Match the original UMI policy setup used by train_uva_umi_policy.sh.
+    use_proprioception: true
+    predict_proprioception: true
+    shift_action: false
+    different_history_freq: true
+
+    # Fine-tune the full MAR together with the VAE encoder. The official UMI
+    # checkpoint path is supplied by the launch script.
+    freeze_mar: false
+    keep_mar_pos_and_fake_trainable: false
+    keep_mar_action_head_trainable: false
+
+    use_student_tokenizer: true
+    student_tokenizer_backend: vae
+    student_tokenizer_params: null
+    vae_student_mode: sample
+    vae_student_feature: shallow
+    vae_encoder_lr_scale: 1.0
+
+    teacher_type: dinov2
+    dinov2_teacher_params:
+      model_name: dinov2_vits14
+      img_size: 224
+      model_img_size: 518
+      checkpoint_path: pretrained_models/dinov2/dinov2_vits14_pretrain.pth
+      loader: timm
+      # ViT-S/14 has 12 blocks; "shallow" selects block 4.
+      feature_layer: shallow
+
+    align_params:
+      enable: true
+      coeff: 0.05
+      loss_type: hybrid
+      teacher_mode: sample
+      align_on: token_feat
+      use_projector: true
+      projector_dim: 512
+      mse_coeff: 0.25
+      stats_coeff: 0.1
+
+    optimizer:
+      learning_rate: 1.0e-4
+
+# Keep the source UMI DataLoader behavior, reducing only the per-device batch.
+task:
+  dataset:
+    dataloader_cfg:
+      batch_size: 16
+      num_workers: 14
+      shuffle: true
+      pin_memory: true
+      persistent_workers: true
+
+training:
+  # 8 GPUs x batch 16 x accumulation 1 gives global batch 128.
+  gradient_accumulate_every: 1
+  lr_warmup_steps: 1000
+  resume: false
+
+logging:
+  project: uva
+  name: train_uva_umi_dinov2_trainable_vae_shallow_policy
+  tags:
+    - umi
+    - cup_arrangement_0
+    - policy_model
+    - dinov2_vits14_block4
+    - shallow_feature_alignment
+    - trainable_vae_encoder
+    - frozen_vae_decoder
+    - official_umi_pretrained
+    - full_mar_finetune

@@ -1,0 +1,29 @@
+# Shallow-to-shallow DINOv2/VAE feature alignment ablation.
+# The VAE uses the penultimate downsampled feature (256 channels at 16x16),
+# while DINOv2 uses its fourth transformer block (ViT-S/14 depth is 12).
+name: uva_libero10_dinov2_trainable_vae_shallow_video_pretrained_conv_fc_action
+
+defaults:
+  - uva_libero10_dinov2_trainable_vae_video_pretrained_conv_fc_action
+  - _self_
+
+model:
+  policy:
+    vae_student_feature: shallow
+    dinov2_teacher_params:
+      feature_layer: shallow
+
+logging:
+  name: train_uva_libero10_dinov2_trainable_vae_shallow_video_pretrained_conv_fc_action
+  tags:
+    - libero10
+    - dinov2_vits14_teacher_block4
+    - shallow_feature_alignment
+    - trainable_vae_encoder
+    - frozen_vae_decoder
+    - video_pretrained_mar
+    - full_mar_finetune
+    - conv_fc
+
+training:
+  resume: false

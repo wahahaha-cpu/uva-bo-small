@@ -1,4 +1,8 @@
-# Adopted from LDM's KL-VAE: https://github.com/CompVis/latent-diffusion
+# Adopted from MAR's KL-VAE implementation:
+# https://github.com/LTH14/mar/blob/main/models/vae.py
+# Checked against MAR commit c6d53f7fa6427634b5850ebed771b7c2d19ea21f.
+# The constructor/checkpoint wrapper below is kept compatible with UVA's
+# `pretrained_models/vae/kl16.ckpt` state-dict layout.
 import torch
 import torch.nn as nn
 
@@ -184,6 +188,12 @@ class Encoder(nn.Module):
         self.resolution = resolution
         self.in_channels = in_channels
 
+        # The penultimate encoder stage is a higher-detail representation than
+        # the final/middle feature while still landing on the KL-16 grid after
+        # its downsample.  For the MAR KL-16 config this is 256 channels at
+        # 16x16 (the final feature is 512 channels at 16x16).
+        self.shallow_level = max(0, self.num_resolutions - 2)
+
         # downsampling
         self.conv_in = torch.nn.Conv2d(
             in_channels, self.ch, kernel_size=3, stride=1, padding=1
@@ -234,6 +244,13 @@ class Encoder(nn.Module):
         )
 
         # end
+        # This is the last spatial feature map before the 1x1 latent moments
+        # projection.  MAR's KL-16 config produces 512 channels at 16x16.
+        self.feature_channels = block_in
+        self.shallow_feature_channels = ch * ch_mult[self.shallow_level]
+        # There is no downsample when a custom encoder has only one level.
+        shallow_downsamples = min(self.shallow_level + 1, self.num_resolutions - 1)
+        self.shallow_feature_resolution = resolution // 2 ** shallow_downsamples
         self.norm_out = Normalize(block_in)
         self.conv_out = torch.nn.Conv2d(
             block_in,
@@ -243,11 +260,18 @@ class Encoder(nn.Module):
             padding=1,
         )
 
-    def forward(self, x):
+    def forward(self, x, return_features=False, feature_level="final"):
         # assert x.shape[2] == x.shape[3] == self.resolution, "{}, {}, {}".format(x.shape[2], x.shape[3], self.resolution)
+
+        if return_features and feature_level not in ("final", "shallow"):
+            raise ValueError(
+                f"Unknown encoder feature_level={feature_level!r}; "
+                "expected 'final' or 'shallow'."
+            )
 
         # timestep embedding
         temb = None
+        shallow_features = None
 
         # downsampling
         hs = [self.conv_in(x)]
@@ -258,7 +282,14 @@ class Encoder(nn.Module):
                     h = self.down[i_level].attn[i_block](h)
                 hs.append(h)
             if i_level != self.num_resolutions - 1:
-                hs.append(self.down[i_level].downsample(hs[-1]))
+                downsampled = self.down[i_level].downsample(hs[-1])
+                hs.append(downsampled)
+                if i_level == self.shallow_level:
+                    shallow_features = downsampled
+            elif i_level == self.shallow_level:
+                # Degenerate one-level encoders have no downsampled tensor;
+                # use the representation immediately before the middle block.
+                shallow_features = hs[-1]
 
         # middle
         h = hs[-1]
@@ -269,7 +300,17 @@ class Encoder(nn.Module):
         # end
         h = self.norm_out(h)
         h = nonlinearity(h)
+        features = h
         h = self.conv_out(h)
+        if return_features:
+            selected_features = (
+                features if feature_level == "final" else shallow_features
+            )
+            if selected_features is None:
+                raise RuntimeError(
+                    "The requested shallow encoder feature was not produced."
+                )
+            return h, selected_features
         return h
 
 
@@ -469,6 +510,8 @@ class AutoencoderKL(nn.Module):
         self.quant_conv = torch.nn.Conv2d(2 * embed_dim, mult * embed_dim, 1)
         self.post_quant_conv = torch.nn.Conv2d(embed_dim, embed_dim, 1)
         self.embed_dim = embed_dim
+        self.encoder_feature_dim = self.encoder.feature_channels
+        self.encoder_shallow_feature_dim = self.encoder.shallow_feature_channels
         if autoencoder_path is not None and os.path.exists(autoencoder_path):
             self.init_from_ckpt(autoencoder_path)
 
@@ -486,11 +529,29 @@ class AutoencoderKL(nn.Module):
 
     def encode(self, x):
         h = self.encoder(x)
+        return self._posterior_from_encoder_output(h)
+
+    def _posterior_from_encoder_output(self, h):
         moments = self.quant_conv(h)
         if not self.use_variational:
             moments = torch.cat((moments, torch.ones_like(moments)), 1)
         posterior = DiagonalGaussianDistribution(moments)
         return posterior
+
+    def encode_with_features(self, x, feature_level="final"):
+        """Return the KL posterior and selected encoder spatial features.
+
+        The feature map is emitted before ``conv_out``/``quant_conv`` so it
+        remains an actual VAE encoder representation rather than a 16-channel
+        latent. ``feature_level`` may be ``final`` or ``shallow``. This keeps
+        the original checkpoint keys and normal ``encode`` behavior unchanged
+        while allowing representation supervision.
+        """
+        h, features = self.encoder(
+            x, return_features=True, feature_level=feature_level
+        )
+        posterior = self._posterior_from_encoder_output(h)
+        return posterior, features
 
     def decode(self, z):
         z = self.post_quant_conv(z)

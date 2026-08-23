@@ -6,7 +6,7 @@ this module instead of changing the policy/MAR image convention.
 """
 
 import os
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 import torch.nn as nn
@@ -120,7 +120,10 @@ class DINOv2Teacher(nn.Module):
 
     Input is ``[B, C, T, H, W]`` in ``[-1, 1]``. Output is
     ``[B, T, S, D]`` where ``S`` is the square patch grid and ``D`` is the
-    backbone embedding width (384 for ViT-S/14).
+    backbone embedding width (384 for ViT-S/14). ``feature_layer='final'``
+    uses the normal final block output; an integer selects a 1-based
+    intermediate transformer block, and ``'shallow'`` selects roughly the
+    first third of the blocks.
     """
 
     def __init__(
@@ -130,6 +133,7 @@ class DINOv2Teacher(nn.Module):
         model_img_size: int = 518,
         checkpoint_path: Optional[str] = None,
         loader: str = "timm",
+        feature_layer: Optional[Union[str, int]] = "final",
     ):
         super().__init__()
         if str(loader).lower() != "timm":
@@ -149,6 +153,14 @@ class DINOv2Teacher(nn.Module):
         self.model.eval()
         for param in self.model.parameters():
             param.requires_grad = False
+
+        self.num_blocks = len(getattr(self.model, "blocks", ()))
+        if self.num_blocks <= 0:
+            raise RuntimeError("Could not infer the DINOv2 transformer depth")
+        self.feature_layer = self._resolve_feature_layer(feature_layer)
+        self.feature_layer_name = (
+            "final" if self.feature_layer is None else str(self.feature_layer)
+        )
 
         self.feat_dim = int(
             getattr(self.model, "embed_dim", getattr(self.model, "num_features", 0))
@@ -171,6 +183,36 @@ class DINOv2Teacher(nn.Module):
         self.register_buffer(
             "std", torch.tensor(IMAGENET_STD).view(1, 3, 1, 1), persistent=False
         )
+
+        print(
+            f"DINOv2 alignment feature layer: {self.feature_layer_name} "
+            f"(depth={self.num_blocks})",
+            flush=True,
+        )
+
+    def _resolve_feature_layer(self, feature_layer):
+        if feature_layer is None:
+            return None
+        if isinstance(feature_layer, str):
+            normalized = feature_layer.strip().lower()
+            if normalized in ("final", "last", "-1"):
+                return None
+            if normalized in ("shallow", "early"):
+                return max(1, self.num_blocks // 3)
+            try:
+                feature_layer = int(normalized)
+            except ValueError as exc:
+                raise ValueError(
+                    "DINOv2 feature_layer must be 'final', 'shallow', "
+                    "or a 1-based block index."
+                ) from exc
+        feature_layer = int(feature_layer)
+        if not 1 <= feature_layer <= self.num_blocks:
+            raise ValueError(
+                f"DINOv2 feature_layer={feature_layer} is outside the "
+                f"1..{self.num_blocks} block range."
+            )
+        return feature_layer
 
     def train(self, mode: bool = True):
         # ``policy.train()`` recursively reaches frozen teachers. Keep DINO in
@@ -200,8 +242,34 @@ class DINOv2Teacher(nn.Module):
         frames = (frames + 1.0) * 0.5
         frames = (frames - self.mean) / self.std
 
-        features = self.model.forward_features(frames)
-        tokens = _extract_patch_tokens(self.model, features)
+        if self.feature_layer is None:
+            features = self.model.forward_features(frames)
+            tokens = _extract_patch_tokens(self.model, features)
+        else:
+            if not hasattr(self.model, "get_intermediate_layers"):
+                raise RuntimeError(
+                    "The selected timm DINOv2 model does not expose "
+                    "get_intermediate_layers()."
+                )
+            intermediate = self.model.get_intermediate_layers(
+                frames,
+                n=[self.feature_layer - 1],
+                reshape=False,
+                return_class_token=False,
+                norm=True,
+            )
+            if torch.is_tensor(intermediate):
+                tokens = intermediate
+            else:
+                if len(intermediate) != 1:
+                    raise RuntimeError(
+                        "Expected one DINOv2 intermediate feature, got "
+                        f"{len(intermediate)}."
+                    )
+                tokens = intermediate[0]
+            prefix_tokens = int(getattr(self.model, "num_prefix_tokens", 1))
+            if tokens.shape[1] == self.num_spatial_tokens + prefix_tokens:
+                tokens = tokens[:, prefix_tokens:]
         if tokens.shape[1] != self.num_spatial_tokens:
             raise RuntimeError(
                 "DINOv2 patch grid mismatch: "

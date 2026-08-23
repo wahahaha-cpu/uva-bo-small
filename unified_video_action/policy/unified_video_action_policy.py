@@ -65,7 +65,18 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
         self.use_proprioception = kwargs["use_proprioception"]
         self.use_student_tokenizer = bool(kwargs.get("use_student_tokenizer", False))
         self.student_tokenizer_params = kwargs.get("student_tokenizer_params", None)
+        self.student_tokenizer_backend = str(
+            kwargs.get("student_tokenizer_backend", "transformer")
+        ).lower()
+        self.vae_student_mode = str(kwargs.get("vae_student_mode", "sample")).lower()
+        self.vae_student_feature = str(
+            kwargs.get("vae_student_feature", "latent")
+        ).lower()
+        self.vae_encoder_lr_scale = float(kwargs.get("vae_encoder_lr_scale", 1.0))
         self.align_params = kwargs.get("align_params", {})
+        self.vae_latent_distill_params = kwargs.get(
+            "vae_latent_distill_params", {}
+        ) or {}
         self.teacher_type = str(kwargs.get("teacher_type", "vae")).lower()
         self.dinov2_teacher_params = kwargs.get("dinov2_teacher_params", {})
         self.jepa_teacher_params = kwargs.get("jepa_teacher_params", {})
@@ -77,6 +88,24 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
             kwargs.get("keep_mar_action_head_trainable", False)
         )
         self.mar_trainable_parameter_names = ()
+
+        if self.student_tokenizer_backend not in ("transformer", "vae"):
+            raise ValueError(
+                "student_tokenizer_backend must be 'transformer' or 'vae', got "
+                f"{self.student_tokenizer_backend!r}."
+            )
+        if self.student_tokenizer_backend == "vae" and not self.use_student_tokenizer:
+            raise ValueError(
+                "student_tokenizer_backend='vae' requires use_student_tokenizer=True."
+            )
+        if self.vae_student_mode not in ("sample", "mode"):
+            raise ValueError("vae_student_mode must be 'sample' or 'mode'.")
+        if self.vae_student_feature not in ("latent", "encoder", "shallow"):
+            raise ValueError(
+                "vae_student_feature must be 'latent', 'encoder', or 'shallow'."
+            )
+        if self.vae_encoder_lr_scale <= 0.0:
+            raise ValueError("vae_encoder_lr_scale must be positive.")
 
         if (
             self.keep_mar_pos_and_fake_trainable
@@ -109,6 +138,42 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
         ).lower()
         self._last_align_metrics = {}
 
+        self.use_vae_latent_distillation = bool(
+            self.vae_latent_distill_params.get("enable", False)
+        )
+        self.vae_latent_distill_coeff = float(
+            self.vae_latent_distill_params.get("coeff", 1.0)
+        )
+        self.vae_latent_distill_loss_type = str(
+            self.vae_latent_distill_params.get("loss_type", "mse")
+        ).lower()
+        self.vae_latent_teacher_mode = str(
+            self.vae_latent_distill_params.get("teacher_mode", "mode")
+        ).lower()
+
+        if self.use_vae_latent_distillation:
+            if not self.use_student_tokenizer:
+                raise ValueError(
+                    "VAE latent distillation requires use_student_tokenizer=True."
+                )
+            if self.student_tokenizer_backend != "transformer":
+                raise ValueError(
+                    "VAE latent distillation requires the transformer student "
+                    "tokenizer backend."
+                )
+            if self.vae_latent_distill_coeff <= 0.0:
+                raise ValueError("VAE latent distillation coeff must be positive.")
+            if self.vae_latent_distill_loss_type not in ("mse", "smooth_l1"):
+                raise ValueError(
+                    "VAE latent distillation loss_type must be 'mse' or "
+                    "'smooth_l1'."
+                )
+            if self.vae_latent_teacher_mode not in ("sample", "mode", "mix"):
+                raise ValueError(
+                    "VAE latent distillation teacher_mode must be 'sample', "
+                    "'mode', or 'mix'."
+                )
+
         if self.teacher_type not in ("vae", "jepa", "dinov2"):
             raise ValueError(
                 f"Unsupported teacher_type={self.teacher_type!r}. "
@@ -137,12 +202,20 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
             use_student_tokenizer=self.use_student_tokenizer,
             teacher_type=self.teacher_type,
             predict_video=bool(autoregressive_model_params.predict_video),
-        ):
+            use_vae_latent_distillation=self.use_vae_latent_distillation,
+        ) or self.student_tokenizer_backend == "vae":
             with torch.no_grad():
                 self.vae_model = AutoencoderKL(**vae_model_params)
             self.vae_model.eval()
             for param in self.vae_model.parameters():
                 param.requires_grad = False
+            if self.student_tokenizer_backend == "vae":
+                # Only the VAE encoding path contributes to the training loss.
+                # Keep the unused decoder frozen while fine-tuning the encoder.
+                self.vae_model.encoder.requires_grad_(True)
+                self.vae_model.quant_conv.requires_grad_(True)
+                self.vae_model.encoder.train()
+                self.vae_model.quant_conv.train()
 
         # =========================== frozen alignment teacher ===========================
         self.dinov2_teacher = None
@@ -160,19 +233,22 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
         self.student_tokenizer = None
         self.align_projector = None
         if self.use_student_tokenizer:
-            if self.student_tokenizer_params is None:
+            if (
+                self.student_tokenizer_backend == "transformer"
+                and self.student_tokenizer_params is None
+            ):
                 raise ValueError(
-                    "use_student_tokenizer=True but student_tokenizer_params is not provided."
+                    "The transformer student tokenizer requires "
+                    "student_tokenizer_params."
                 )
-            self.student_tokenizer = StudentLatentTokenizer(**self.student_tokenizer_params)
+            if self.student_tokenizer_backend == "transformer":
+                self.student_tokenizer = StudentLatentTokenizer(
+                    **self.student_tokenizer_params
+                )
             if self.use_alignment and self.teacher_type in ("jepa", "dinov2"):
                 self.align_use_projector = self.align_on == "token_feat"
                 if self.align_on == "latent":
-                    latent_dim = int(
-                        self.student_tokenizer_params.get(
-                            "latent_channels", autoregressive_model_params.vae_embed_dim
-                        )
-                    )
+                    latent_dim = self._student_latent_dim(autoregressive_model_params)
                     self.teacher_latent_projector = torch.nn.Sequential(
                         torch.nn.Linear(
                             self.teacher_feat_dim, self.align_projector_dim
@@ -185,12 +261,18 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
                         torch.nn.Linear(self.align_projector_dim, latent_dim),
                     )
             if self.use_alignment and self.align_use_projector:
-                hidden_dim = int(self.student_tokenizer_params.get("hidden_dim", 384))
-                latent_dim = int(
-                    self.student_tokenizer_params.get(
-                        "latent_channels", autoregressive_model_params.vae_embed_dim
+                if self.student_tokenizer_backend == "vae":
+                    if self.vae_student_feature == "encoder":
+                        hidden_dim = int(self.vae_model.encoder_feature_dim)
+                    elif self.vae_student_feature == "shallow":
+                        hidden_dim = int(self.vae_model.encoder_shallow_feature_dim)
+                    else:
+                        hidden_dim = int(autoregressive_model_params.vae_embed_dim)
+                else:
+                    hidden_dim = int(
+                        self.student_tokenizer_params.get("hidden_dim", 384)
                     )
-                )
+                latent_dim = self._student_latent_dim(autoregressive_model_params)
                 align_target_dim = latent_dim
                 if self.teacher_type in ("jepa", "dinov2"):
                     align_target_dim = self.teacher_feat_dim
@@ -289,12 +371,26 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
 
     @staticmethod
     def _requires_vae_model(
-        *, use_student_tokenizer: bool, teacher_type: str, predict_video: bool
+        *,
+        use_student_tokenizer: bool,
+        teacher_type: str,
+        predict_video: bool,
+        use_vae_latent_distillation: bool = False,
     ) -> bool:
         return (
             not use_student_tokenizer
             or teacher_type == "vae"
             or predict_video
+            or use_vae_latent_distillation
+        )
+
+    def _student_latent_dim(self, autoregressive_model_params) -> int:
+        if self.student_tokenizer_backend == "vae":
+            return int(autoregressive_model_params.vae_embed_dim)
+        return int(
+            self.student_tokenizer_params.get(
+                "latent_channels", autoregressive_model_params.vae_embed_dim
+            )
         )
 
     @staticmethod
@@ -413,6 +509,19 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
         print("---------------------------------------------------------------")
 
 
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.vae_model is not None:
+            if self.student_tokenizer_backend == "vae":
+                # The encoder follows the policy mode; the frozen decoding path
+                # stays deterministic during train-time rollout and validation.
+                self.vae_model.decoder.eval()
+                self.vae_model.post_quant_conv.eval()
+            else:
+                self.vae_model.eval()
+        return self
+
+
     def predict_action(
         self, obs_dict: Dict[str, torch.Tensor], language_goal=None
     ) -> Dict[str, torch.Tensor]:
@@ -471,7 +580,7 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
             {"obs": obs_dict}, task_name=self.task_name, eval=True, **self.kwargs
         )
 
-        if self.use_student_tokenizer and self.student_tokenizer is not None:
+        if self.use_student_tokenizer:
             if self.use_proprioception and proprioception_input is not None:
                 if "second_image" in proprioception_input:
                     second_image_z, _ = self._encode_student_latent(
@@ -555,6 +664,19 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
             optim_groups.extend(
                 self.add_weight_decay(self.student_tokenizer, weight_decay=weight_decay)
             )
+        if self.student_tokenizer_backend == "vae":
+            vae_optim_groups = self.add_weight_decay(
+                self.vae_model.encoder, weight_decay=weight_decay
+            )
+            vae_optim_groups.extend(
+                self.add_weight_decay(
+                    self.vae_model.quant_conv, weight_decay=weight_decay
+                )
+            )
+            vae_learning_rate = learning_rate * self.vae_encoder_lr_scale
+            for param_group in vae_optim_groups:
+                param_group["lr"] = vae_learning_rate
+            optim_groups.extend(vae_optim_groups)
         if self.align_projector is not None:
             optim_groups.extend(
                 self.add_weight_decay(self.align_projector, weight_decay=weight_decay)
@@ -576,10 +698,13 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
 
         return optimizer
 
-    def _extract_teacher_latent(self, x: torch.Tensor) -> torch.Tensor:
+    def _extract_teacher_latent(
+        self, x: torch.Tensor, teacher_mode=None
+    ) -> torch.Tensor:
         """
         Teacher path (frozen VAE): x [B, C, T, H, W] -> z [B, T, C_lat, H_lat, W_lat]
         """
+        teacher_mode = self.align_teacher_mode if teacher_mode is None else teacher_mode
         x = x.float()
         bsz, channels, timesteps, height, width = x.size()
         with torch.no_grad():
@@ -587,15 +712,30 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
                 bsz * timesteps, channels, height, width
             )
             posterior = self.vae_model.encode(x_flat)
-            if self.align_teacher_mode == "mode" and hasattr(posterior, "mode"):
+            if teacher_mode == "mode" and hasattr(posterior, "mode"):
                 z = posterior.mode()
-            elif self.align_teacher_mode == "mix" and hasattr(posterior, "mode"):
+            elif teacher_mode == "mix" and hasattr(posterior, "mode"):
                 z = 0.5 * (posterior.mode() + posterior.sample())
             else:
                 z = posterior.sample()
             z = z.mul_(0.2325)
             z = z.reshape(bsz, timesteps, z.shape[1], z.shape[2], z.shape[3])
         return z
+
+    def _compute_vae_latent_distillation_loss(
+        self, student_latent: torch.Tensor, teacher_latent: torch.Tensor
+    ) -> torch.Tensor:
+        if student_latent.shape != teacher_latent.shape:
+            raise ValueError(
+                "VAE teacher/student latent shape mismatch: "
+                f"student={tuple(student_latent.shape)}, "
+                f"teacher={tuple(teacher_latent.shape)}"
+            )
+        student_latent = student_latent.float()
+        teacher_latent = teacher_latent.float()
+        if self.vae_latent_distill_loss_type == "smooth_l1":
+            return F.smooth_l1_loss(student_latent, teacher_latent)
+        return F.mse_loss(student_latent, teacher_latent)
 
     def _latent_to_tokens(self, z: torch.Tensor) -> torch.Tensor:
         # z [B, T, C, H, W] -> [B, T, S, C]
@@ -648,8 +788,73 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
         )
 
     def _encode_student_latent(self, x: torch.Tensor):
-        latent, token_feat = self.student_tokenizer(x)
+        if self.student_tokenizer_backend == "transformer":
+            return self.student_tokenizer(x)
+
+        x = x.float()
+        bsz, channels, timesteps, height, width = x.shape
+        x_flat = x.permute(0, 2, 1, 3, 4).reshape(
+            bsz * timesteps, channels, height, width
+        )
+        if self.vae_student_feature in ("encoder", "shallow"):
+            # ``encoder`` is the public config name for the final encoder
+            # representation; the VAE API calls that level ``final``.
+            feature_level = (
+                "final" if self.vae_student_feature == "encoder" else "shallow"
+            )
+            posterior, encoder_features = self.vae_model.encode_with_features(
+                x_flat, feature_level=feature_level
+            )
+        else:
+            posterior = self.vae_model.encode(x_flat)
+            encoder_features = None
+        if self.vae_student_mode == "mode":
+            latent = posterior.mode()
+        else:
+            latent = posterior.sample()
+        latent = latent * 0.2325
+        latent = latent.reshape(
+            bsz, timesteps, latent.shape[1], latent.shape[2], latent.shape[3]
+        )
+        if encoder_features is None:
+            token_feat = self._latent_to_tokens(latent)
+        else:
+            encoder_features = encoder_features.reshape(
+                bsz,
+                timesteps,
+                encoder_features.shape[1],
+                encoder_features.shape[2],
+                encoder_features.shape[3],
+            )
+            token_feat = self._feature_map_to_tokens(
+                encoder_features,
+                target_height=latent.shape[-2],
+                target_width=latent.shape[-1],
+            )
         return latent, token_feat
+
+    @staticmethod
+    def _feature_map_to_tokens(
+        features: torch.Tensor, target_height=None, target_width=None
+    ) -> torch.Tensor:
+        """Convert [B,T,C,H,W] features to [B,T,H*W,C] tokens."""
+        bsz, timesteps, channels, height, width = features.shape
+        if target_height is not None and target_width is not None:
+            if (height, width) != (target_height, target_width):
+                features = F.adaptive_avg_pool2d(
+                    features.reshape(bsz * timesteps, channels, height, width),
+                    (target_height, target_width),
+                ).reshape(
+                    bsz,
+                    timesteps,
+                    channels,
+                    target_height,
+                    target_width,
+                )
+                height, width = target_height, target_width
+        return features.permute(0, 1, 3, 4, 2).reshape(
+            bsz, timesteps, height * width, channels
+        )
 
     def _compute_alignment_loss(
         self, student_tokens: torch.Tensor, teacher_tokens: torch.Tensor
@@ -740,10 +945,13 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
             batch, task_name=self.task_name, **self.kwargs
         )
         align_loss = torch.tensor(0.0, device=x.device)
-        if self.use_student_tokenizer and self.student_tokenizer is not None:
+        vae_latent_loss = torch.tensor(0.0, device=x.device)
+        self._last_align_metrics = {}
+        if self.use_student_tokenizer:
             c_img, x_img = torch.chunk(x, 2, dim=2)
             z, z_token_feat = self._encode_student_latent(x_img)
             c, c_token_feat = self._encode_student_latent(c_img)
+            vae_distill_inputs = [("future", z, x_img), ("condition", c, c_img)]
 
             if proprioception_input is not None:
                 if "second_image" in proprioception_input:
@@ -751,11 +959,60 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
                         proprioception_input["second_image"]
                     )
                     proprioception_input["second_image_z"] = second_image_z
+                    vae_distill_inputs.append(
+                        (
+                            "second_image",
+                            second_image_z,
+                            proprioception_input["second_image"],
+                        )
+                    )
                 if "pred_second_image" in proprioception_input:
                     pred_second_image_z, _ = self._encode_student_latent(
                         proprioception_input["pred_second_image"]
                     )
                     proprioception_input["pred_second_image_z"] = pred_second_image_z
+                    vae_distill_inputs.append(
+                        (
+                            "pred_second_image",
+                            pred_second_image_z,
+                            proprioception_input["pred_second_image"],
+                        )
+                    )
+
+            if self.use_vae_latent_distillation:
+                vae_latent_losses = []
+                student_latent_norms = []
+                teacher_latent_norms = []
+                for _, student_latent, teacher_rgb in vae_distill_inputs:
+                    teacher_latent = self._extract_teacher_latent(
+                        teacher_rgb, teacher_mode=self.vae_latent_teacher_mode
+                    )
+                    vae_latent_losses.append(
+                        self._compute_vae_latent_distillation_loss(
+                            student_latent, teacher_latent
+                        )
+                    )
+                    student_latent_norms.append(
+                        student_latent.detach().float().norm(dim=2).mean()
+                    )
+                    teacher_latent_norms.append(
+                        teacher_latent.detach().float().norm(dim=2).mean()
+                    )
+                vae_latent_loss = torch.stack(vae_latent_losses).mean()
+                self._last_align_metrics.update(
+                    {
+                        "vae_latent_loss": vae_latent_loss.detach(),
+                        "vae_latent_weighted_loss": (
+                            self.vae_latent_distill_coeff * vae_latent_loss
+                        ).detach(),
+                        "vae_student_latent_norm": torch.stack(
+                            student_latent_norms
+                        ).mean(),
+                        "vae_teacher_latent_norm": torch.stack(
+                            teacher_latent_norms
+                        ).mean(),
+                    }
+                )
 
             if self.use_alignment:
                 if self.teacher_type in ("jepa", "dinov2"):
@@ -798,17 +1055,24 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
                     student_c_tokens, teacher_c_tokens
                 )
                 align_loss = 0.5 * (align_z + align_c)
-                self._last_align_metrics = {
-                    "align_loss": align_loss.detach(),
-                    "align_cos": 0.5 * (metrics_z["align_cos"] + metrics_c["align_cos"]),
-                    "align_mse": 0.5 * (metrics_z["align_mse"] + metrics_c["align_mse"]),
-                    "align_stats": 0.5
-                    * (metrics_z["align_stats"] + metrics_c["align_stats"]),
-                    "student_norm": 0.5
-                    * (metrics_z["student_norm"] + metrics_c["student_norm"]),
-                    "teacher_norm": 0.5
-                    * (metrics_z["teacher_norm"] + metrics_c["teacher_norm"]),
-                }
+                self._last_align_metrics.update(
+                    {
+                        "align_loss": align_loss.detach(),
+                        "align_weighted_loss": (
+                            self.align_coeff * align_loss
+                        ).detach(),
+                        "align_cos": 0.5
+                        * (metrics_z["align_cos"] + metrics_c["align_cos"]),
+                        "align_mse": 0.5
+                        * (metrics_z["align_mse"] + metrics_c["align_mse"]),
+                        "align_stats": 0.5
+                        * (metrics_z["align_stats"] + metrics_c["align_stats"]),
+                        "student_norm": 0.5
+                        * (metrics_z["student_norm"] + metrics_c["student_norm"]),
+                        "teacher_norm": 0.5
+                        * (metrics_z["teacher_norm"] + metrics_c["teacher_norm"]),
+                    }
+                )
         else:
             x, z, c, _, proprioception_input = get_vae_latent(
                 x, self.vae_model, eval=False, proprioception_input=proprioception_input
@@ -830,6 +1094,8 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
         )
         if self.use_student_tokenizer and self.use_alignment:
             loss = loss + self.align_coeff * align_loss
+        if self.use_vae_latent_distillation:
+            loss = loss + self.vae_latent_distill_coeff * vae_latent_loss
 
         # DDP safety: always attach every trainable parameter to graph.
         # Checking `param.grad is None` inside forward is unstable across iterations.
@@ -842,6 +1108,11 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
 
         if self.student_tokenizer is not None:
             for param in self.student_tokenizer.parameters():
+                if param.requires_grad:
+                    loss = loss + _ddp_unused_term(param)
+
+        if self.student_tokenizer_backend == "vae":
+            for param in self.vae_model.parameters():
                 if param.requires_grad:
                     loss = loss + _ddp_unused_term(param)
 

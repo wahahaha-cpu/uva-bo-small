@@ -1,0 +1,41 @@
+# UMI full-dynamics training with video, action, and proprioception prediction.
+# DINOv2 final tokens supervise the student's final token representation, while
+# the frozen KL-VAE supervises the exact 16-channel latent passed into MAR.
+name: uva_umi_dinov2_student_vae_latent_full_dynamic
+
+defaults:
+  - uva_umi_dinov2_student_vae_latent_policy
+  - _self_
+
+model:
+  policy:
+    selected_training_mode: full_dynamic_model
+    autoregressive_model_params:
+      predict_video: true
+    action_model_params:
+      predict_action: true
+      act_model_type: conv_fc
+    use_proprioception: true
+    predict_proprioception: true
+
+    # Original DINO alignment: final teacher output against final student tokens.
+    dinov2_teacher_params:
+      feature_layer: final
+
+logging:
+  name: train_uva_umi_dinov2_student_vae_latent_full_dynamic
+  tags:
+    - umi
+    - cup_arrangement_0
+    - full_dynamic_model
+    - video_prediction
+    - action_prediction
+    - proprioception_input
+    - proprioception_prediction
+    - student_tokenizer_small
+    - early_patchify
+    - dinov2_vits14_final
+    - vae_latent_distillation
+    - frozen_teachers
+    - official_umi_pretrained
+    - full_mar_finetune

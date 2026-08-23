@@ -17,12 +17,6 @@ dataset:
     cup_arrangement_0:
       include_episode_num: -1 # -1 means all episodes
       mask_mirror: True
-    towel_folding_0:
-      include_episode_num: -1
-      mask_mirror: False
-    mouse_arrangement_0:
-      include_episode_num: -1
-      mask_mirror: False
 
   zarr_path: "" # Will be overridden in the initialization function
   normalizer_type: none
