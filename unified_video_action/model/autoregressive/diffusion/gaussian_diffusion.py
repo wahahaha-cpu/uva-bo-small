@@ -743,7 +743,15 @@ class GaussianDiffusion:
         output = th.where((t == 0), decoder_nll, kl)
         return {"output": output, "pred_xstart": out["pred_xstart"]}
 
-    def training_losses(self, model, x_start, t, model_kwargs=None, noise=None):
+    def training_losses(
+        self,
+        model,
+        x_start,
+        t,
+        model_kwargs=None,
+        noise=None,
+        channel_weights=None,
+    ):
         """
         Compute training losses for a single timestep.
         :param model: the model to evaluate loss on.
@@ -759,14 +767,19 @@ class GaussianDiffusion:
             model_kwargs = {}
         if noise is None:
             noise = th.randn_like(x_start)
-        x_t = self.q_sample(x_start, t, noise=noise)
+
+        # The surrounding policy may run under fp16 autocast. Keep stochastic
+        # target construction in fp32 so residual squares cannot overflow.
+        x_start_fp32 = x_start.float()
+        noise_fp32 = noise.float()
+        x_t = self.q_sample(x_start_fp32, t, noise=noise_fp32)
 
         terms = {}
 
         if self.loss_type == LossType.KL or self.loss_type == LossType.RESCALED_KL:
             terms["loss"] = self._vb_terms_bpd(
                 model=model,
-                x_start=x_start,
+                x_start=x_start_fp32,
                 x_t=x_t,
                 t=t,
                 clip_denoised=False,
@@ -775,7 +788,9 @@ class GaussianDiffusion:
             if self.loss_type == LossType.RESCALED_KL:
                 terms["loss"] *= self.num_timesteps
         elif self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE:
-            model_output = model(x_t, t, **model_kwargs)
+            # Inner diffusion networks are not separately wrapped by
+            # Accelerate's output cast; promote before loss arithmetic.
+            model_output = model(x_t, t, **model_kwargs).float()
 
             if self.model_var_type in [
                 ModelVarType.LEARNED,
@@ -789,7 +804,7 @@ class GaussianDiffusion:
                 frozen_out = th.cat([model_output.detach(), model_var_values], dim=1)
                 terms["vb"] = self._vb_terms_bpd(
                     model=lambda *args, r=frozen_out: r,
-                    x_start=x_start,
+                    x_start=x_start_fp32,
                     x_t=x_t,
                     t=t,
                     clip_denoised=False,
@@ -801,13 +816,29 @@ class GaussianDiffusion:
 
             target = {
                 ModelMeanType.PREVIOUS_X: self.q_posterior_mean_variance(
-                    x_start=x_start, x_t=x_t, t=t
+                    x_start=x_start_fp32, x_t=x_t, t=t
                 )[0],
-                ModelMeanType.START_X: x_start,
-                ModelMeanType.EPSILON: noise,
+                ModelMeanType.START_X: x_start_fp32,
+                ModelMeanType.EPSILON: noise_fp32,
             }[self.model_mean_type]
-            assert model_output.shape == target.shape == x_start.shape
-            terms["mse"] = mean_flat((target - model_output) ** 2)
+            assert model_output.shape == target.shape == x_start_fp32.shape
+            squared_error = (target - model_output).square()
+            if channel_weights is None:
+                terms["mse"] = mean_flat(squared_error)
+            else:
+                if squared_error.ndim != 2:
+                    raise ValueError(
+                        "Channel-weighted diffusion loss expects a 2D target."
+                    )
+                weights = channel_weights.to(
+                    device=squared_error.device,
+                    dtype=squared_error.dtype,
+                ).reshape(1, -1)
+                if weights.shape[1] != squared_error.shape[1]:
+                    raise ValueError(
+                        "channel_weights must match the diffusion target channels."
+                    )
+                terms["mse"] = (squared_error * weights).sum(dim=1) / weights.sum()
             if "vb" in terms:
                 terms["loss"] = terms["mse"] + terms["vb"]
             else:

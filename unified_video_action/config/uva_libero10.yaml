@@ -24,12 +24,15 @@ training:
   debug: false
   device: cuda:0
   gradient_accumulate_every: 1
+  max_grad_norm: null
+  max_consecutive_nonfinite_updates: 8
   lr_scheduler: cosine
   lr_warmup_steps: 1000
   max_train_steps: null
   max_val_steps: null
   num_epochs: 3050
   resume: true
+  resume_checkpoint_path: null
   rollout_every: 20
   sample_every: 5
   seed: 42

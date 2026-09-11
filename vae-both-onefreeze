@@ -1,0 +1,535 @@
+先纠正一个重要点：当前实现不是“整个 VAE 全部解冻”，而是只解冻：
+
+  - vae_model.encoder
+  - vae_model.quant_conv
+
+  VAE decoder 和 post_quant_conv 仍然冻结。原因是当前训练损失没有经过 decoder；即使把 decoder 的 requires_grad 打开，也不会得到梯度。若要训练 decoder，必须额外加入图像重建损失。
+
+  另外，0.1 学习率比例不是理论要求，是我加的保守启发式。原配置的基础学习率是 1e-4：
+
+  model.policy.optimizer.learning_rate: 0.0001
+
+  当前实际分组是：
+
+   模块                                     状态      学习率
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  ━━━━━━━━  ━━━━━━━━
+   MAR、action head、alignment projector    可训练      1e-4
+  ───────────────────────────────────────  ────────  ────────
+   VAE encoder、quant_conv                  可训练      1e-5
+  ───────────────────────────────────────  ────────  ────────
+   VAE decoder、post_quant_conv             冻结          无
+  ───────────────────────────────────────  ────────  ────────
+   DINOv2 teacher                           冻结          无
+
+  0.1 的考虑是 VAE 来自预训练 checkpoint，降低学习率可以减小灾难性遗忘。但这不是公平 ablation 的必要条件，而且 MAR 也是预训练的、却仍用了 1e-4，所以这个设置确实带有经验性。
+
+  如果目标是严格比较 “ViT tokenizer vs VAE tokenizer”，我建议 VAE 也使用 1e-4，即：
+
+  VAE_ENCODER_LR_SCALE=1.0
+
+  我已经暂停了之前排队的训练任务，当前没有启动新实验，也没有中断 Cosmos 任务。
+
+  原来的 ViT token-feature 路径
+
+  原来的 lightweight Transformer 是随机初始化的 student：
+
+  RGB [B, 3, T, 256, 256]
+          |
+          v
+  StudentLatentTokenizer
+    stem -> patch_embed -> 5 Transformer blocks -> temporal mixer
+          |
+          +--> token_feat [B, T, 256, 304]
+          |       |
+          |       v
+          |    projector 304 -> 512 -> 512 -> 384
+          |       |
+          |       v
+          |    DINOv2 tokens [B, T, 256, 384]
+          |
+          +--> latent [B, T, 16, 16, 16] -> MAR
+
+  这里的 DINOv2 ViT-S/14 是冻结的 teacher；真正学习的是 lightweight Transformer 的 token_feat 和 alignment projector。
+
+  现在的 VAE 路径
+
+  当前代码已经不再使用 student ViT 的 token feature：
+
+  RGB [B, 3, T, 256, 256]
+          |
+          v
+  VAE encoder + quant_conv
+          |
+          v
+  posterior.sample() 或 posterior.mode()
+          |
+          v
+  latent [B, T, 16, 16, 16]
+          |
+          +--> 空间展平
+          |    [B, T, 256, 16]
+          |       |
+          |       v
+          |    projector 16 -> 512 -> 512 -> 384
+          |       |
+          |       v
+          |    DINOv2 tokens [B, T, 256, 384]
+          |
+          +--> MAR
+
+  所以当前 align_on: token_feat 只是沿用了旧配置名称；在 VAE backend 中，它实际表示“VAE 的空间 latent token”，不是 ViT hidden token。
+
+  VAE 的 16x16 空间网格和 DINOv2 的 16x16 patch 网格都含有 256 个 token，因此当前不需要空间重采样。VAE 每帧独立编码，没有原来 student Transformer 的 temporal mixer；时序建模交给后面的
+  MAR。
+
+  Alignment loss 本身没有改，仍然是：
+
+  L = L_MAR + 0.05 * L_align
+
+  L_align =
+      hybrid cosine/MSE
+      + 0.25 * MSE
+      + 0.1 * mean/std statistics loss
+
+  VAE encoder 的梯度来自：
+
+  1. DINO token alignment loss；
+  2. MAR 的 action/video loss。
+
+  DINO teacher 始终使用 torch.no_grad()，不会更新。
+
+  全部新增/修改代码
+
+  当前工作树涉及三个文件：
+
+  - project/uva-bo-small/unified_video_action/policy/unified_video_action_policy.py
+  - project/uva-bo-small/unified_video_action/config/uva_libero10_dinov2_trainable_vae_video_pretrained_conv_fc_action.yaml
+  - project/uva-bo-small/scripts/training/train_uva_libero10_dinov2_trainable_vae_8gpu.sh
+
+  下面是 policy.py 的全部新增逻辑：
+
+  self.student_tokenizer_backend = str(
+      kwargs.get("student_tokenizer_backend", "transformer")
+  ).lower()
+  self.vae_student_mode = str(kwargs.get("vae_student_mode", "sample")).lower()
+  self.vae_encoder_lr_scale = float(kwargs.get("vae_encoder_lr_scale", 0.1))
+
+  if self.student_tokenizer_backend not in ("transformer", "vae"):
+      raise ValueError(
+          "student_tokenizer_backend must be 'transformer' or 'vae', got "
+          f"{self.student_tokenizer_backend!r}."
+      )
+  if self.student_tokenizer_backend == "vae" and not self.use_student_tokenizer:
+      raise ValueError(
+          "student_tokenizer_backend='vae' requires use_student_tokenizer=True."
+      )
+  if self.vae_student_mode not in ("sample", "mode"):
+      raise ValueError("vae_student_mode must be 'sample' or 'mode'.")
+  if self.vae_encoder_lr_scale <= 0.0:
+      raise ValueError("vae_encoder_lr_scale must be positive.")
+
+  if self._requires_vae_model(
+      use_student_tokenizer=self.use_student_tokenizer,
+      teacher_type=self.teacher_type,
+      predict_video=bool(autoregressive_model_params.predict_video),
+  ) or self.student_tokenizer_backend == "vae":
+      with torch.no_grad():
+          self.vae_model = AutoencoderKL(**vae_model_params)
+
+      self.vae_model.eval()
+
+      for param in self.vae_model.parameters():
+          param.requires_grad = False
+
+      if self.student_tokenizer_backend == "vae":
+          # Only the VAE encoding path contributes to the training loss.
+          # Keep the unused decoder frozen while fine-tuning the encoder.
+          self.vae_model.encoder.requires_grad_(True)
+          self.vae_model.quant_conv.requires_grad_(True)
+          self.vae_model.encoder.train()
+          self.vae_model.quant_conv.train()
+
+  self.student_tokenizer = None
+  self.align_projector = None
+
+  if self.use_student_tokenizer:
+      if (
+          self.student_tokenizer_backend == "transformer"
+          and self.student_tokenizer_params is None
+      ):
+          raise ValueError(
+              "The transformer student tokenizer requires "
+              "student_tokenizer_params."
+          )
+
+      if self.student_tokenizer_backend == "transformer":
+          self.student_tokenizer = StudentLatentTokenizer(
+              **self.student_tokenizer_params
+          )
+
+      if self.use_alignment and self.teacher_type in ("jepa", "dinov2"):
+          self.align_use_projector = self.align_on == "token_feat"
+
+          if self.align_on == "latent":
+              latent_dim = self._student_latent_dim(autoregressive_model_params)
+
+              self.teacher_latent_projector = torch.nn.Sequential(
+                  torch.nn.Linear(
+                      self.teacher_feat_dim,
+                      self.align_projector_dim,
+                  ),
+                  torch.nn.SiLU(),
+                  torch.nn.Linear(
+                      self.align_projector_dim,
+                      self.align_projector_dim,
+                  ),
+                  torch.nn.SiLU(),
+                  torch.nn.Linear(
+                      self.align_projector_dim,
+                      latent_dim,
+                  ),
+              )
+
+      if self.use_alignment and self.align_use_projector:
+          if self.student_tokenizer_backend == "vae":
+              hidden_dim = int(autoregressive_model_params.vae_embed_dim)
+          else:
+              hidden_dim = int(
+                  self.student_tokenizer_params.get("hidden_dim", 384)
+              )
+
+          latent_dim = self._student_latent_dim(autoregressive_model_params)
+
+          align_target_dim = latent_dim
+          if self.teacher_type in ("jepa", "dinov2"):
+              align_target_dim = self.teacher_feat_dim
+
+          self.align_projector = torch.nn.Sequential(
+              torch.nn.Linear(
+                  hidden_dim,
+                  self.align_projector_dim,
+              ),
+              torch.nn.SiLU(),
+              torch.nn.Linear(
+                  self.align_projector_dim,
+                  self.align_projector_dim,
+              ),
+              torch.nn.SiLU(),
+              torch.nn.Linear(
+                  self.align_projector_dim,
+                  align_target_dim,
+              ),
+          )
+
+  def _student_latent_dim(self, autoregressive_model_params) -> int:
+      if self.student_tokenizer_backend == "vae":
+          return int(autoregressive_model_params.vae_embed_dim)
+
+      return int(
+          self.student_tokenizer_params.get(
+              "latent_channels",
+              autoregressive_model_params.vae_embed_dim,
+          )
+      )
+
+  def train(self, mode: bool = True):
+      super().train(mode)
+
+      if self.vae_model is not None:
+          if self.student_tokenizer_backend == "vae":
+              # The encoder follows the policy mode; the frozen decoding path
+              # stays deterministic during train-time rollout and validation.
+              self.vae_model.decoder.eval()
+              self.vae_model.post_quant_conv.eval()
+          else:
+              self.vae_model.eval()
+
+      return self
+
+  原来的两个判断：
+
+  if self.use_student_tokenizer and self.student_tokenizer is not None:
+
+  被改成：
+
+  if self.use_student_tokenizer:
+
+  这样 VAE backend 下即使 self.student_tokenizer is None，也会进入 VAE 编码路径。
+
+  优化器新增的参数分组：
+
+  if self.student_tokenizer_backend == "vae":
+      vae_optim_groups = self.add_weight_decay(
+          self.vae_model.encoder,
+          weight_decay=weight_decay,
+      )
+
+      vae_optim_groups.extend(
+          self.add_weight_decay(
+              self.vae_model.quant_conv,
+              weight_decay=weight_decay,
+          )
+      )
+
+      vae_learning_rate = learning_rate * self.vae_encoder_lr_scale
+
+      for param_group in vae_optim_groups:
+          param_group["lr"] = vae_learning_rate
+
+      optim_groups.extend(vae_optim_groups)
+
+  VAE backend 的编码函数：
+
+  def _encode_student_latent(self, x: torch.Tensor):
+      if self.student_tokenizer_backend == "transformer":
+          return self.student_tokenizer(x)
+
+      x = x.float()
+      bsz, channels, timesteps, height, width = x.shape
+
+      x_flat = x.permute(0, 2, 1, 3, 4).reshape(
+          bsz * timesteps,
+          channels,
+          height,
+          width,
+      )
+
+      posterior = self.vae_model.encode(x_flat)
+
+      if self.vae_student_mode == "mode":
+          latent = posterior.mode()
+      else:
+          latent = posterior.sample()
+
+      latent = latent * 0.2325
+
+      latent = latent.reshape(
+          bsz,
+          timesteps,
+          latent.shape[1],
+          latent.shape[2],
+          latent.shape[3],
+      )
+
+      return latent, self._latent_to_tokens(latent)
+
+  训练时仍然使用同一套 student/alignment 分支：
+
+  if self.use_student_tokenizer:
+      c_img, x_img = torch.chunk(x, 2, dim=2)
+
+      z, z_token_feat = self._encode_student_latent(x_img)
+      c, c_token_feat = self._encode_student_latent(c_img)
+
+      if self.use_alignment:
+          if self.teacher_type in ("jepa", "dinov2"):
+              teacher = (
+                  self.jepa_teacher
+                  if self.teacher_type == "jepa"
+                  else self.dinov2_teacher
+              )
+
+              teacher_z_tokens = teacher.extract_tokens(x_img)
+              teacher_c_tokens = teacher.extract_tokens(c_img)
+
+              if self.align_on == "latent":
+                  student_z_tokens = self._latent_to_tokens(z)
+                  student_c_tokens = self._latent_to_tokens(c)
+
+                  teacher_z_tokens = self.teacher_latent_projector(
+                      teacher_z_tokens
+                  )
+                  teacher_c_tokens = self.teacher_latent_projector(
+                      teacher_c_tokens
+                  )
+              else:
+                  student_z_tokens = z_token_feat
+                  student_c_tokens = c_token_feat
+
+              teacher_z_tokens = self._resample_teacher_tokens(
+                  student_z_tokens,
+                  teacher_z_tokens,
+              )
+              teacher_c_tokens = self._resample_teacher_tokens(
+                  student_c_tokens,
+                  teacher_c_tokens,
+              )
+
+  最后把 VAE 的可训练参数接入 DDP 的零项：
+
+  if self.student_tokenizer_backend == "vae":
+      for param in self.vae_model.parameters():
+          if param.requires_grad:
+              loss = loss + _ddp_unused_term(param)
+
+  完整新配置文件
+
+  # DINOv2 patch supervision with the pretrained KL-VAE encoder replacing the
+  # lightweight Transformer tokenizer. The decoder stays frozen because this
+  # training objective does not backpropagate through decoded pixels.
+  name: uva_libero10_dinov2_trainable_vae_video_pretrained_conv_fc_action
+
+  defaults:
+    - uva_libero10_dinov2_small_token_feat_video_pretrained_conv_fc_action
+    - _self_
+
+  model:
+    policy:
+      use_student_tokenizer: true
+      student_tokenizer_backend: vae
+      student_tokenizer_params: null
+      vae_student_mode: sample
+      vae_encoder_lr_scale: 0.1
+      freeze_mar: false
+      align_params:
+        align_on: token_feat
+        use_projector: true
+
+  training:
+    resume: false
+
+  logging:
+    project: uva-repa-dinov2
+    name: train_uva_libero10_dinov2_trainable_vae_video_pretrained_conv_fc_action
+    tags:
+      - train_uva_libero10_dinov2_trainable_vae
+      - libero10
+      - dinov2_vits14_teacher
+      - trainable_vae_encoder
+      - frozen_vae_decoder
+      - video_pretrained_mar
+      - full_mar_finetune
+      - conv_fc
+
+  完整新训练脚本
+
+  #!/usr/bin/env bash
+  set -euo pipefail
+
+  export CUDA_HOME="${CUDA_HOME:-/data1/local_userdata/jinboning/conda/envs/repa}"
+  export PATH="${CUDA_HOME}/bin:${PATH}"
+  export LD_LIBRARY_PATH="${CUDA_HOME}/lib:/usr/lib/nvidia:/home/jinboning/.mujoco/mujoco210/bin:${LD_LIBRARY_PATH:-}"
+  export MUJOCO_EGL_DEVICE_ID="${MUJOCO_EGL_DEVICE_ID:-0}"
+  export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
+
+  GPU_IDS="${GPU_IDS:-0,1,2,3,4,5,6,7}"
+  NUM_PROCESSES="${NUM_PROCESSES:-8}"
+  PER_DEVICE_BATCH="${PER_DEVICE_BATCH:-8}"
+  GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-2}"
+  EXPECTED_GLOBAL_BATCH="${EXPECTED_GLOBAL_BATCH:-128}"
+  LR_WARMUP_STEPS="${LR_WARMUP_STEPS:-2000}"
+  VAE_ENCODER_LR_SCALE="${VAE_ENCODER_LR_SCALE:-0.1}"
+  ROLLOUT_EVERY="${ROLLOUT_EVERY:-5}"
+  CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-5}"
+  VIDEO_CHECKPOINT="${VIDEO_CHECKPOINT:-checkpoints/libero10_video.ckpt}"
+  DINO_CHECKPOINT="${DINO_CHECKPOINT:-pretrained_models/dinov2/dinov2_vits14_pretrain.pth}"
+  WANDB_PROJECT="${WANDB_PROJECT:-uva-repa-dinov2}"
+  WAIT_FOR_GPU_FREE_MB="${WAIT_FOR_GPU_FREE_MB:-0}"
+  WAIT_POLL_SECONDS="${WAIT_POLL_SECONDS:-60}"
+
+  IFS=',' read -r -a GPU_ID_ARRAY <<< "${GPU_IDS}"
+
+  if (( ${#GPU_ID_ARRAY[@]} != NUM_PROCESSES )); then
+      echo "GPU_IDS count (${#GPU_ID_ARRAY[@]}) does not match NUM_PROCESSES (${NUM_PROCESSES})." >&2
+      exit 2
+  fi
+
+  GLOBAL_BATCH=$((NUM_PROCESSES * PER_DEVICE_BATCH * GRAD_ACCUM_STEPS))
+
+  if (( GLOBAL_BATCH != EXPECTED_GLOBAL_BATCH )); then
+      echo "Global batch mismatch: ${GLOBAL_BATCH}, expected ${EXPECTED_GLOBAL_BATCH}." >&2
+      exit 2
+  fi
+
+  required_paths=(
+      pretrained_models/vae/kl16.ckpt
+      "${VIDEO_CHECKPOINT}"
+      "${DINO_CHECKPOINT}"
+      data/libero_10
+  )
+
+  for required_path in "${required_paths[@]}"; do
+      if [[ ! -e "${required_path}" ]]; then
+          echo "Required path not found: ${required_path}" >&2
+          exit 1
+      fi
+  done
+
+  if [[ -z "${ACCELERATE_BIN:-}" ]]; then
+      if command -v accelerate >/dev/null 2>&1; then
+          ACCELERATE_BIN="accelerate"
+      else
+          ACCELERATE_BIN="/data1/local_userdata/jinboning/conda/envs/repa/bin/accelerate"
+      fi
+  fi
+
+  if [[ "${ACCELERATE_BIN}" != "accelerate" && ! -x "${ACCELERATE_BIN}" ]]; then
+      echo "Accelerate executable not found: ${ACCELERATE_BIN}" >&2
+      exit 1
+  fi
+
+  if (( WAIT_FOR_GPU_FREE_MB > 0 )); then
+      echo "Waiting until all ${NUM_PROCESSES} selected GPUs have at least ${WAIT_FOR_GPU_FREE_MB} MiB free."
+
+      while true; do
+          READY_GPU_COUNT="$({
+              nvidia-smi --id="${GPU_IDS}" \
+                  --query-gpu=memory.free \
+                  --format=csv,noheader,nounits
+          } | awk -v threshold="${WAIT_FOR_GPU_FREE_MB}" '$1 >= threshold {count++} END {print count + 0}')"
+
+          if (( READY_GPU_COUNT == NUM_PROCESSES )); then
+              echo "GPU memory threshold reached; starting training."
+              break
+          fi
+
+          printf '%s: %s/%s GPUs ready; checking again in %ss.\n' \
+              "$(date '+%Y-%m-%d %H:%M:%S')" \
+              "${READY_GPU_COUNT}" \
+              "${NUM_PROCESSES}" \
+              "${WAIT_POLL_SECONDS}"
+
+          sleep "${WAIT_POLL_SECONDS}"
+      done
+  fi
+
+  RUN_NAME="${RUN_NAME:-uva_libero10_dinov2_trainable_vae_8gpu_$(date +%Y%m%d_%H%M%S)}"
+  RUN_DIR="${RUN_DIR:-checkpoints/${RUN_NAME}}"
+
+  launch_args=(
+      --num_processes="${NUM_PROCESSES}"
+      train.py
+      --config-dir=unified_video_action/config
+      --config-name=uva_libero10_dinov2_trainable_vae_video_pretrained_conv_fc_action.yaml
+      model.policy.autoregressive_model_params.pretrained_model_path="${VIDEO_CHECKPOINT}"
+      model.policy.dinov2_teacher_params.checkpoint_path="${DINO_CHECKPOINT}"
+      model.policy.vae_encoder_lr_scale="${VAE_ENCODER_LR_SCALE}"
+      model.policy.action_model_params.predict_action=True
+      model.policy.action_model_params.act_model_type=conv_fc
+      model.policy.selected_training_mode=policy_model
+      model.policy.freeze_mar=False
+      model.policy.keep_mar_pos_and_fake_trainable=False
+      +model.policy.keep_mar_action_head_trainable=False
+      dataloader.batch_size="${PER_DEVICE_BATCH}"
+      val_dataloader.batch_size="${PER_DEVICE_BATCH}"
+      training.gradient_accumulate_every="${GRAD_ACCUM_STEPS}"
+      training.lr_warmup_steps="${LR_WARMUP_STEPS}"
+      training.rollout_every="${ROLLOUT_EVERY}"
+      training.checkpoint_every="${CHECKPOINT_EVERY}"
+      training.resume=False
+      checkpoint.save_last_ckpt=True
+      logging.project="${WANDB_PROJECT}"
+      logging.name="${RUN_NAME}"
+      logging.tags="[libero10,dinov2_vits14_teacher,trainable_vae_encoder,frozen_vae_decoder,video_pretrained_mar,unfrozen_mar,conv_fc,8gpu]"
+      hydra.run.dir="${RUN_DIR}"
+  )
+
+  if [[ "${DRY_RUN:-0}" == "1" ]]; then
+      printf '%q ' env CUDA_VISIBLE_DEVICES="${GPU_IDS}" "${ACCELERATE_BIN}" launch "${launch_args[@]}"
+      printf '\n'
+      exit 0
+  fi
+
+  CUDA_VISIBLE_DEVICES="${GPU_IDS}" "${ACCELERATE_BIN}" launch "${launch_args[@]}"
+
+  当前这些修改都还没有 commit 或 push；checkpoints 目录也没有被改动。

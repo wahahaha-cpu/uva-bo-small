@@ -54,6 +54,8 @@ policy:
   action_model_params:
     predict_action: False
     act_model_type: conv_fc
+    enable_gripper_loss_weight: False
+    gripper_loss_weight: 5.0
   
   shift_action: True
     
@@ -63,5 +65,4 @@ policy:
     betas:
     - 0.9
     - 0.95
-
 

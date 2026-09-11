@@ -2,7 +2,7 @@
 set -euo pipefail
 
 PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-TRAIN_SCRIPT="${PROJECT_DIR}/scripts/training/train_uva_umi_dinov2_student_vae_latent_full_dynamic_8gpu.sh"
+TRAIN_SCRIPT="${TRAIN_SCRIPT:-${PROJECT_DIR}/scripts/training/train_uva_umi_dinov2_student_vae_latent_full_dynamic_8gpu.sh}"
 GPU_IDS="${GPU_IDS:-0,1,2,3,4,5,6,7}"
 POLL_SECONDS="${POLL_SECONDS:-30}"
 MEMORY_LIMIT_MIB="${MEMORY_LIMIT_MIB:-1024}"

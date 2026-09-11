@@ -3,6 +3,7 @@ import os
 from typing import Dict, Tuple
 import torch.nn.functional as F
 import random
+from contextlib import nullcontext
 import numpy as np
 
 from unified_video_action.model.common.normalizer import LinearNormalizer
@@ -62,12 +63,19 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
         self.selected_training_mode = kwargs["selected_training_mode"]
 
         self.use_history_action = kwargs["use_history_action"]
+        history_action_modes = kwargs.get("history_action_modes", None)
+        self.history_action_modes = (
+            None
+            if history_action_modes is None
+            else frozenset(str(mode) for mode in history_action_modes)
+        )
         self.use_proprioception = kwargs["use_proprioception"]
         self.use_student_tokenizer = bool(kwargs.get("use_student_tokenizer", False))
         self.student_tokenizer_params = kwargs.get("student_tokenizer_params", None)
         self.student_tokenizer_backend = str(
             kwargs.get("student_tokenizer_backend", "transformer")
         ).lower()
+        self.video_target = str(kwargs.get("video_target", "student")).lower()
         self.vae_student_mode = str(kwargs.get("vae_student_mode", "sample")).lower()
         self.vae_student_feature = str(
             kwargs.get("vae_student_feature", "latent")
@@ -93,6 +101,11 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
             raise ValueError(
                 "student_tokenizer_backend must be 'transformer' or 'vae', got "
                 f"{self.student_tokenizer_backend!r}."
+            )
+        if self.video_target not in ("student", "vae"):
+            raise ValueError(
+                "video_target must be 'student' or 'vae', got "
+                f"{self.video_target!r}."
             )
         if self.student_tokenizer_backend == "vae" and not self.use_student_tokenizer:
             raise ValueError(
@@ -428,6 +441,55 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
         if self.keep_mar_action_head_trainable and not action_head_parameter_names:
             raise RuntimeError("No trainable MAR action-head parameters were found.")
 
+    def _adapt_pretrained_history_projection(
+        self, pretrained_state_dict, model_state_dict
+    ):
+        key = "proj_cond_x_layer.weight"
+        if not self.use_history_action or key not in pretrained_state_dict:
+            return
+
+        source = pretrained_state_dict[key]
+        target = model_state_dict[key]
+        embed_dim = target.shape[0]
+        if (
+            source.ndim != 2
+            or target.ndim != 2
+            or source.shape[0] != target.shape[0]
+            or target.shape[1] != source.shape[1] + embed_dim
+        ):
+            return
+
+        # History is inserted immediately before the action block. Copy every
+        # pretrained input block to its equivalent location and make the new
+        # history block initially neutral.
+        history_offset = (3 if self.model.predict_wrist_img else 2) * embed_dim
+        if history_offset > source.shape[1]:
+            return
+        expanded = source.new_zeros(target.shape)
+        expanded[:, :history_offset] = source[:, :history_offset]
+        expanded[:, history_offset + embed_dim :] = source[:, history_offset:]
+        pretrained_state_dict[key] = expanded
+        print(
+            "Expanded pretrained MAR input projection with a zero-initialized "
+            "history-action block."
+        )
+
+    def _load_pretrained_policy_components(self, policy_state_dict):
+        for attribute_name in ("student_tokenizer", "align_projector"):
+            module = getattr(self, attribute_name, None)
+            if module is None:
+                continue
+            prefix = f"{attribute_name}."
+            component_state = {
+                key[len(prefix) :]: value
+                for key, value in policy_state_dict.items()
+                if key.startswith(prefix)
+            }
+            if not component_state:
+                continue
+            module.load_state_dict(component_state, strict=True)
+            print(f"Loaded pretrained {attribute_name} from policy checkpoint.")
+
     def load_pretrained_model(self):
         print("----------------------------------------------------------------------")
         print("Loading pretrained model: ", self.pretrained_model_path)
@@ -450,6 +512,9 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
                 }  # remove 'model.'
 
                 model_state_dict = self.model.state_dict()
+                self._adapt_pretrained_history_projection(
+                    pretrained_diffusion_model_ckpt_, model_state_dict
+                )
                 pretrained_state_dict = {
                     k: v
                     for k, v in pretrained_diffusion_model_ckpt_.items()
@@ -477,6 +542,9 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
                 missing_keys, unexpected_keys = self.model.load_state_dict(
                     model_state_dict, strict=False
                 )
+                self._load_pretrained_policy_components(
+                    pretrained_diffusion_model_ckpt["state_dicts"]["ema_model"]
+                )
             else:
                 raise NotImplementedError
 
@@ -487,6 +555,9 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
             ]
 
             model_state_dict = self.model.state_dict()
+            self._adapt_pretrained_history_projection(
+                pretrained_diffusion_model_ckpt_, model_state_dict
+            )
             pretrained_state_dict = {
                 k: v
                 for k, v in pretrained_diffusion_model_ckpt_.items()
@@ -860,47 +931,59 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
         self, student_tokens: torch.Tensor, teacher_tokens: torch.Tensor
     ):
         student_tokens_raw = student_tokens
-        if self.align_projector is not None:
-            student_tokens = self.align_projector(student_tokens)
-
-        assert student_tokens.shape == teacher_tokens.shape, (
-            student_tokens.shape,
-            teacher_tokens.shape,
+        autocast_context = (
+            torch.autocast(device_type=student_tokens.device.type, enabled=False)
+            if student_tokens.device.type in ("cuda", "cpu")
+            else nullcontext()
         )
+        # The projector starts from a randomly initialized student feature and
+        # is trained jointly with MAR. Keep both its matmuls and the alignment
+        # reductions in fp32; casting only after the projector is too late when
+        # fp16 activations have already overflowed.
+        with autocast_context:
+            student_tokens = student_tokens.float()
+            teacher_tokens = teacher_tokens.float()
+            if self.align_projector is not None:
+                student_tokens = self.align_projector(student_tokens)
 
-        student_tokens = student_tokens.float()
-        teacher_tokens = teacher_tokens.float()
+            assert student_tokens.shape == teacher_tokens.shape, (
+                student_tokens.shape,
+                teacher_tokens.shape,
+            )
 
-        eps = 1e-6
-        student_norm = F.normalize(student_tokens, dim=-1, eps=eps)
-        teacher_norm = F.normalize(teacher_tokens, dim=-1, eps=eps)
-        cosine = (student_norm * teacher_norm).sum(dim=-1).mean()
-        cosine_loss = 1.0 - cosine
-        mse_loss = F.mse_loss(student_tokens, teacher_tokens)
+            eps = 1e-6
+            student_norm = F.normalize(student_tokens, dim=-1, eps=eps)
+            teacher_norm = F.normalize(teacher_tokens, dim=-1, eps=eps)
+            cosine = (student_norm * teacher_norm).sum(dim=-1).mean()
+            cosine_loss = 1.0 - cosine
+            mse_loss = F.mse_loss(student_tokens, teacher_tokens)
 
-        student_mu = student_tokens.mean(dim=(0, 1, 2))
-        teacher_mu = teacher_tokens.mean(dim=(0, 1, 2))
-        student_std = student_tokens.std(dim=(0, 1, 2)).clamp_min(eps)
-        teacher_std = teacher_tokens.std(dim=(0, 1, 2)).clamp_min(eps)
-        mean_loss = F.mse_loss(student_mu, teacher_mu)
-        std_loss = F.mse_loss(student_std, teacher_std)
-        stats_loss = mean_loss + std_loss
+            student_mu = student_tokens.mean(dim=(0, 1, 2))
+            teacher_mu = teacher_tokens.mean(dim=(0, 1, 2))
+            student_std = student_tokens.std(dim=(0, 1, 2)).clamp_min(eps)
+            teacher_std = teacher_tokens.std(dim=(0, 1, 2)).clamp_min(eps)
+            mean_loss = F.mse_loss(student_mu, teacher_mu)
+            std_loss = F.mse_loss(student_std, teacher_std)
+            stats_loss = mean_loss + std_loss
 
-        if self.align_loss_type == "mse":
-            base_loss = mse_loss
-        elif self.align_loss_type == "hybrid":
-            base_loss = 0.5 * (cosine_loss + mse_loss)
-        else:
-            base_loss = cosine_loss
+            if self.align_loss_type == "mse":
+                base_loss = mse_loss
+            elif self.align_loss_type == "hybrid":
+                base_loss = 0.5 * (cosine_loss + mse_loss)
+            else:
+                base_loss = cosine_loss
 
-        total_align_loss = (
-            base_loss + self.align_mse_coeff * mse_loss + self.align_stats_coeff * stats_loss
-        )
+            total_align_loss = (
+                base_loss
+                + self.align_mse_coeff * mse_loss
+                + self.align_stats_coeff * stats_loss
+            )
         metrics = {
             "align_cos": cosine.detach(),
             "align_mse": mse_loss.detach(),
             "align_stats": stats_loss.detach(),
-            "student_norm": student_tokens_raw.detach().norm(dim=-1).mean(),
+            "student_norm": student_tokens_raw.detach().float().norm(dim=-1).mean(),
+            "projected_student_norm": student_tokens.detach().norm(dim=-1).mean(),
             "teacher_norm": teacher_tokens.detach().norm(dim=-1).mean(),
         }
         return total_align_loss, metrics
@@ -932,6 +1015,7 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
             normalizer_type=self.normalizer_type,
             actions=batch["action"],
         )
+        selected_mode = random.choice(self.task_modes)
         batch = normalize_obs(
             normalizer=self.normalizer,
             normalizer_type=self.normalizer_type,
@@ -946,12 +1030,36 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
         )
         align_loss = torch.tensor(0.0, device=x.device)
         vae_latent_loss = torch.tensor(0.0, device=x.device)
+        vae_video_target = None
         self._last_align_metrics = {}
         if self.use_student_tokenizer:
             c_img, x_img = torch.chunk(x, 2, dim=2)
             z, z_token_feat = self._encode_student_latent(x_img)
             c, c_token_feat = self._encode_student_latent(c_img)
             vae_distill_inputs = [("future", z, x_img), ("condition", c, c_img)]
+            self._last_align_metrics["student_latent_norm"] = 0.5 * (
+                z.detach().float().norm(dim=2).mean()
+                + c.detach().float().norm(dim=2).mean()
+            )
+
+            if (
+                self.video_target == "vae"
+                and self.autoregressive_model_params.predict_video
+                and selected_mode in {"video_model", "dynamic_model", "full_dynamic_model"}
+            ):
+                if self.vae_model is None:
+                    raise RuntimeError(
+                        "video_target='vae' requires the frozen VAE model."
+                    )
+                vae_video_target, _ = extract_latent_autoregressive(
+                    self.vae_model, x_img
+                )
+                # The VAE remains frozen; retain its future latent as a detached
+                # fp32 denoising target for the diffusion loss.
+                vae_video_target = vae_video_target.float()
+                self._last_align_metrics["vae_video_target_norm"] = (
+                    vae_video_target.detach().norm(dim=2).mean()
+                )
 
             if proprioception_input is not None:
                 if "second_image" in proprioception_input:
@@ -1069,6 +1177,11 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
                         * (metrics_z["align_stats"] + metrics_c["align_stats"]),
                         "student_norm": 0.5
                         * (metrics_z["student_norm"] + metrics_c["student_norm"]),
+                        "projected_student_norm": 0.5
+                        * (
+                            metrics_z["projected_student_norm"]
+                            + metrics_c["projected_student_norm"]
+                        ),
                         "teacher_norm": 0.5
                         * (metrics_z["teacher_norm"] + metrics_c["teacher_norm"]),
                     }
@@ -1080,17 +1193,22 @@ class UnifiedVideoActionPolicy(BaseImagePolicy):
         history_trajectory, trajectory = get_trajectory(
             nactions, T, self.shift_action, use_history_action=self.use_history_action
         )
-
-        selected_mode = random.choice(self.task_modes)
+        history_model_input = history_trajectory
+        if (
+            self.history_action_modes is not None
+            and selected_mode not in self.history_action_modes
+        ):
+            history_model_input = None
 
         loss, video_loss, act_loss = self.model(
             z,
             c,
-            history_trajectory,
+            history_model_input,
             trajectory,
             text_latents,
             task_mode=selected_mode,
             proprioception_input=proprioception_input,
+            target_latents=vae_video_target,
         )
         if self.use_student_tokenizer and self.use_alignment:
             loss = loss + self.align_coeff * align_loss

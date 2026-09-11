@@ -294,6 +294,23 @@ class MAR(nn.Module):
 
         # ========= Action Diffusion Loss =========
         if self.predict_action:
+            action_loss_channel_weights = None
+            if action_model_params.get("enable_gripper_loss_weight", False):
+                if self.task_name != "umi" or act_dim != 10:
+                    raise ValueError(
+                        "Gripper loss weighting currently requires a 10D UMI action."
+                    )
+                gripper_loss_weight = float(
+                    action_model_params.get("gripper_loss_weight", 5.0)
+                )
+                if gripper_loss_weight <= 0.0:
+                    raise ValueError("gripper_loss_weight must be positive.")
+                action_loss_channel_weights = [1.0] * act_dim
+                action_loss_channel_weights[9] = gripper_loss_weight
+                print(
+                    "Action loss channel weights:", action_loss_channel_weights
+                )
+
             self.diffactloss = DiffActLoss(
                 target_channels=act_dim,
                 z_channels=decoder_embed_dim,
@@ -307,6 +324,7 @@ class MAR(nn.Module):
                 act_diff_testing_steps=act_diff_testing_steps,
                 language_emb_model=self.language_emb_model,
                 language_emb_model_type=self.language_emb_model_type,
+                channel_weights=action_loss_channel_weights,
             )
 
         
@@ -795,6 +813,7 @@ class MAR(nn.Module):
         text_latents=None,
         task_mode=None,
         proprioception_input={},
+        target_latents=None,
     ):
         self.device = cond.device
         B, T, C, H, W = imgs.size()
@@ -847,7 +866,41 @@ class MAR(nn.Module):
             if self.language_emb_model_type == 1:
                 text_latents = self.text_proj_cond(text_latents)
 
-        gt_latents = x.clone().detach()
+        if target_latents is None:
+            gt_latents = x.clone().detach()
+        else:
+            if target_latents.ndim != 5:
+                raise ValueError(
+                    "Video target latents must have shape [B, T, C, H, W], got "
+                    f"{tuple(target_latents.shape)}"
+                )
+            target_B, target_T, target_C, target_H, target_W = target_latents.shape
+            expected_hw = self.seq_h * self.patch_size
+            if (target_B, target_T, target_C, target_H, target_W) != (
+                B,
+                T,
+                self.vae_embed_dim,
+                expected_hw,
+                expected_hw,
+            ):
+                raise ValueError(
+                    "Video target latent shape must match MAR input geometry: "
+                    f"expected {(B, T, self.vae_embed_dim, expected_hw, expected_hw)}, "
+                    f"got {tuple(target_latents.shape)}"
+                )
+            # Keep the frozen-VAE denoising target in fp32. It is detached and
+            # does not update the VAE, but casting it to fp16 here makes the
+            # diffusion residual vulnerable to overflow under autocast.
+            target_latents = target_latents.to(device=x.device, dtype=torch.float32)
+            target_latents = rearrange(
+                target_latents, "b t c h w -> (b t) c h w"
+            )
+            target_latents = self.patchify(target_latents)
+            gt_latents = rearrange(
+                target_latents,
+                "(b t) seq_len c -> b t seq_len c",
+                b=B,
+            ).detach()
 
         # ========= Predicted Wrist Image =========
         if self.predict_wrist_img:

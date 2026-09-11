@@ -21,11 +21,27 @@ class DiffActLoss(nn.Module):
         act_diff_training_steps=1000,
         act_diff_testing_steps="100",
         act_model_type="conv_fc",
+        channel_weights=None,
         **kwargs
     ):
         super(DiffActLoss, self).__init__()
         self.in_channels = target_channels
         self.n_frames = n_frames
+
+        loss_channel_weights = None
+        if channel_weights is not None:
+            loss_channel_weights = torch.as_tensor(
+                channel_weights, dtype=torch.float32
+            )
+            if loss_channel_weights.shape != (target_channels,):
+                raise ValueError(
+                    "channel_weights must have one value per target channel."
+                )
+            if torch.any(loss_channel_weights <= 0):
+                raise ValueError("channel_weights must be positive.")
+        self.register_buffer(
+            "loss_channel_weights", loss_channel_weights, persistent=False
+        )
 
         self.language_emb_model = kwargs["language_emb_model"]
         self.language_emb_model_type = kwargs["language_emb_model_type"]
@@ -156,7 +172,11 @@ class DiffActLoss(nn.Module):
 
         model_kwargs = dict(c=z)
         loss_dict = self.train_diffusion.training_losses(
-            self.net, target, t, model_kwargs
+            self.net,
+            target,
+            t,
+            model_kwargs,
+            channel_weights=self.loss_channel_weights,
         )
 
         action_loss = loss_dict["loss"].reshape(bsz, seq_len)

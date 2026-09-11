@@ -1,0 +1,118 @@
+name: uva_pusht_m_vae_policy
+
+defaults:
+  - task: pusht
+  - model: uva
+  - _self_
+
+dataloader:
+  batch_size: 8
+  num_workers: 8
+  persistent_workers: false
+  pin_memory: true
+  shuffle: true
+
+val_dataloader:
+  batch_size: 8
+  num_workers: 8
+  persistent_workers: false
+  pin_memory: true
+  shuffle: false
+
+training:
+  checkpoint_every: 10
+  debug: false
+  device: cuda:0
+  gradient_accumulate_every: 4
+  lr_scheduler: cosine
+  lr_warmup_steps: 1000
+  max_train_steps: null
+  max_val_steps: null
+  num_epochs: 3050
+  resume: false
+  rollout_every: 10
+  sample_every: 5
+  seed: 42
+  tqdm_interval_sec: 1.0
+  use_ema: true
+  val_every: 1
+  mixed_precision: 'fp16'
+
+checkpoint:
+  save_last_ckpt: true
+  save_last_snapshot: false
+  topk:
+    monitor_key: test_mean_score
+    format_str: epoch={epoch:04d}-test_mean_score={test_mean_score:.3f}.ckpt
+    k: 1
+    mode: max
+
+ema:
+  _target_: unified_video_action.model.autoregressive.ema_model.EMAModel
+  inv_gamma: 1.0
+  max_value: 0.9999
+  min_value: 0.0
+  power: 0.75
+  update_after_step: 0
+
+logging:
+  group: null
+  id: null
+  mode: online
+  name: uva_pusht_m_vae_policy
+  project: unified_video_action
+  resume: false
+  tags:
+  - train_uva_pusht_m_vae_policy
+  - pusht_m
+  - vae_encoder_trainable
+  - action_only
+  - mar_base
+
+multi_run:
+  run_dir: /data1/local_userdata/jinboning/uva-bo-small/outputs/train_uva_pusht_m_vae_policy
+  wandb_name_base: train_uva_pusht_m_vae_policy
+
+task:
+  name: pusht_m
+  dataset:
+    dataset_path: data/pusht_multitask
+    dataset_type: multitask
+  env_runner:
+    fix_goal: false
+    n_train: 1
+    n_train_vis: 0
+    n_test: 50
+    n_test_vis: 4
+    legacy_test: true
+    max_steps: 300
+    n_obs_steps: 16
+    n_action_steps: 8
+    past_action: false
+
+model:
+  policy:
+    selected_training_mode: policy_model
+    use_student_tokenizer: true
+    student_tokenizer_backend: vae
+    student_tokenizer_params: null
+    vae_student_mode: sample
+    vae_student_feature: latent
+    vae_encoder_lr_scale: 1.0
+    video_target: student
+    use_proprioception: false
+    use_history_action: false
+    different_history_freq: false
+    predict_wrist_img: false
+    predict_proprioception: false
+    freeze_mar: false
+    keep_mar_pos_and_fake_trainable: false
+    keep_mar_action_head_trainable: false
+    vae_model_params:
+      autoencoder_path: pretrained_models/vae/kl16.ckpt
+    autoregressive_model_params:
+      pretrained_model_path: pretrained_models/mar/mar_base/checkpoint-last.pth
+      predict_video: true
+    action_model_params:
+      predict_action: true
+      act_model_type: conv_fc

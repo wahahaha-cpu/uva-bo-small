@@ -202,6 +202,18 @@ class TrainUnifiedVideoActionWorkspace(BaseWorkspace):
         accumulation_steps = int(cfg.training.gradient_accumulate_every)
         if accumulation_steps < 1:
             raise ValueError("training.gradient_accumulate_every must be >= 1")
+        max_grad_norm = cfg.training.get("max_grad_norm", None)
+        if max_grad_norm is not None:
+            max_grad_norm = float(max_grad_norm)
+            if max_grad_norm <= 0.0:
+                raise ValueError("training.max_grad_norm must be positive or null")
+        max_consecutive_nonfinite_updates = int(
+            cfg.training.get("max_consecutive_nonfinite_updates", 8)
+        )
+        if max_consecutive_nonfinite_updates < 1:
+            raise ValueError(
+                "training.max_consecutive_nonfinite_updates must be >= 1"
+            )
         # ``len(train_dataloader)`` is global before prepare() and local after
         # prepare().  Derive the local count explicitly so scheduler horizon is
         # independent of world size while still matching Accelerate's sharding.
@@ -254,15 +266,39 @@ class TrainUnifiedVideoActionWorkspace(BaseWorkspace):
 
         # resume training
         if cfg.training.resume:
-            lastest_ckpt_path = self.get_checkpoint_path()
-            if lastest_ckpt_path.is_file():
-                accelerator.print(f"Resuming from checkpoint {lastest_ckpt_path}")
-                self.load_checkpoint(path=lastest_ckpt_path)
+            resume_checkpoint_path = cfg.training.get(
+                "resume_checkpoint_path", None
+            )
+            explicit_resume_path = resume_checkpoint_path not in (None, "", "null")
+            if explicit_resume_path:
+                checkpoint_path = pathlib.Path(
+                    str(resume_checkpoint_path)
+                ).expanduser()
+            else:
+                checkpoint_path = self.get_checkpoint_path()
+            if checkpoint_path.is_file():
+                accelerator.print(f"Resuming from checkpoint {checkpoint_path}")
+                current_output_dir = self.output_dir
+                self.load_checkpoint(
+                    path=checkpoint_path,
+                    include_keys=self.include_keys,
+                )
+                # A full workspace checkpoint stores its original output path.
+                # Recovery experiments must continue writing to the new Hydra run.
+                self._output_dir = current_output_dir
+            elif explicit_resume_path:
+                raise FileNotFoundError(
+                    f"Resume checkpoint not found: {checkpoint_path}"
+                )
 
         # configure ema
         ema: EMAModel = None
         if cfg.training.use_ema:
             ema = hydra.utils.instantiate(cfg.ema, model=self.ema_model)
+            # Checkpoints store averaged weights but not the lightweight EMA
+            # counter. Preserve the pre-resume decay schedule.
+            ema.optimization_step = int(self.global_step)
+            ema.decay = ema.get_decay(ema.optimization_step)
 
         # configure env
         rollout_enabled = (
@@ -304,11 +340,25 @@ class TrainUnifiedVideoActionWorkspace(BaseWorkspace):
         if self.ema_model is not None:
             self.ema_model.to(device)
 
+        trainable_parameters = [
+            param for param in self.model.parameters() if param.requires_grad
+        ]
+        if not trainable_parameters:
+            raise RuntimeError("The policy has no trainable parameters")
+        accelerator.print(
+            "Numerical safeguards: "
+            f"mixed_precision={accelerator.mixed_precision}, "
+            f"max_grad_norm={max_grad_norm}, "
+            "fp32_diffusion_loss=True, "
+            f"max_consecutive_nonfinite_updates={max_consecutive_nonfinite_updates}"
+        )
+
         # training loop
         stop_training = (
             cfg.training.max_train_steps is not None
             and self.global_step >= int(cfg.training.max_train_steps)
         )
+        consecutive_nonfinite_updates = 0
         for local_epoch_idx in range(cfg.training.num_epochs):
             if stop_training:
                 break
@@ -325,6 +375,7 @@ class TrainUnifiedVideoActionWorkspace(BaseWorkspace):
             ) as tepoch:
                 num_batches = len(train_dataloader)
                 self.optimizer.zero_grad(set_to_none=True)
+                window_has_nonfinite_loss = False
                 for batch_idx, batch in enumerate(tepoch):
                     _, _, window_size, is_update_step = accumulation_window(
                         batch_idx,
@@ -346,34 +397,103 @@ class TrainUnifiedVideoActionWorkspace(BaseWorkspace):
                     else:
                         raw_loss, (loss_diffusion, loss_action) = self.model(batch)
 
-                    # Average gradients over the effective global batch.  The old
-                    # code summed micro-batch means, multiplying the update by K
-                    # for 4-GPU x accumulation-4 versus 8-GPU x accumulation-1.
-                    scaled_loss = raw_loss / float(window_size)
-                    if is_update_step:
-                        accelerator.backward(scaled_loss)
-                    else:
-                        with accelerator.no_sync(self.model):
+                    local_loss_finite = torch.isfinite(raw_loss.detach()).all().to(
+                        dtype=torch.int32
+                    )
+                    finite_loss_processes = accelerator.reduce(
+                        local_loss_finite, reduction="sum"
+                    )
+                    loss_finite_all = (
+                        int(finite_loss_processes.item())
+                        == accelerator.num_processes
+                    )
+                    window_has_nonfinite_loss = (
+                        window_has_nonfinite_loss or not loss_finite_all
+                    )
+
+                    # Average gradients over the effective global batch. If one
+                    # rank sees a non-finite loss, all ranks discard the complete
+                    # accumulation window so DDP cannot hang or update partially.
+                    if not window_has_nonfinite_loss:
+                        scaled_loss = raw_loss / float(window_size)
+                        if is_update_step:
                             accelerator.backward(scaled_loss)
+                        else:
+                            with accelerator.no_sync(self.model):
+                                accelerator.backward(scaled_loss)
 
                     # One optimizer/LR/EMA update per completed accumulation window.
                     optimizer_step_succeeded = False
+                    grad_finite_all = not window_has_nonfinite_loss
+                    grad_norm_value = float("nan")
+                    abort_for_nonfinite = False
                     if is_update_step:
-                        self.optimizer.step()
+                        optimizer_step_attempted = False
+                        if not window_has_nonfinite_loss:
+                            # Unscale first so the reported norm and clipping
+                            # threshold describe the actual fp32 gradients.
+                            accelerator.unscale_gradients(self.optimizer)
+                            grad_norm = torch.nn.utils.clip_grad_norm_(
+                                trainable_parameters,
+                                max_norm=(
+                                    max_grad_norm
+                                    if max_grad_norm is not None
+                                    else float("inf")
+                                ),
+                                error_if_nonfinite=False,
+                            )
+                            grad_norm_value = float(
+                                grad_norm.detach().float().item()
+                            )
+                            local_grad_finite = torch.isfinite(
+                                grad_norm.detach()
+                            ).to(dtype=torch.int32)
+                            finite_grad_processes = accelerator.reduce(
+                                local_grad_finite, reduction="sum"
+                            )
+                            grad_finite_all = (
+                                int(finite_grad_processes.item())
+                                == accelerator.num_processes
+                            )
+
+                            if grad_finite_all:
+                                optimizer_step_attempted = True
+                                self.optimizer.step()
+                            else:
+                                # For fp16, let GradScaler observe the recorded
+                                # overflow and lower its scale; it will skip AdamW.
+                                scaler = getattr(self.optimizer, "scaler", None)
+                                if scaler is not None:
+                                    optimizer_step_attempted = True
+                                    self.optimizer.step()
+
                         self.optimizer.zero_grad(set_to_none=True)
-                        optimizer_step_succeeded = not bool(
-                            getattr(self.optimizer, "step_was_skipped", False)
+                        optimizer_step_succeeded = (
+                            optimizer_step_attempted
+                            and grad_finite_all
+                            and not bool(
+                                getattr(self.optimizer, "step_was_skipped", False)
+                            )
                         )
                         if optimizer_step_succeeded:
+                            consecutive_nonfinite_updates = 0
                             self.lr_scheduler.step()
                             if cfg.training.use_ema:
                                 ema.step(accelerator.unwrap_model(self.model))
+                        else:
+                            consecutive_nonfinite_updates += 1
+                            abort_for_nonfinite = (
+                                consecutive_nonfinite_updates
+                                >= max_consecutive_nonfinite_updates
+                            )
+                        window_has_nonfinite_loss = False
 
                     # logging
                     raw_loss_cpu = raw_loss.item()
 
                     tepoch.set_postfix(loss=raw_loss_cpu, refresh=False)
-                    train_losses.append(raw_loss_cpu)
+                    if loss_finite_all:
+                        train_losses.append(raw_loss_cpu)
 
                     if cfg.model.policy.autoregressive_model_params.predict_video:
                         loss_diffusion_cpu = loss_diffusion.item()
@@ -395,9 +515,18 @@ class TrainUnifiedVideoActionWorkspace(BaseWorkspace):
                         "optimizer_step_skipped": float(
                             is_update_step and not optimizer_step_succeeded
                         ),
+                        "loss_finite": float(loss_finite_all),
+                        "grad_finite": float(grad_finite_all),
+                        "grad_norm": grad_norm_value,
+                        "consecutive_nonfinite_updates": float(
+                            consecutive_nonfinite_updates
+                        ),
                         "epoch": self.epoch,
                         "lr": self.lr_scheduler.get_last_lr()[0],
                     }
+                    scaler = getattr(self.optimizer, "scaler", None)
+                    if scaler is not None:
+                        step_log["amp_scale"] = float(scaler.get_scale())
                     policy_module = accelerator.unwrap_model(self.model)
                     if hasattr(policy_module, "_last_align_metrics"):
                         align_metrics = getattr(policy_module, "_last_align_metrics", {})
@@ -413,6 +542,13 @@ class TrainUnifiedVideoActionWorkspace(BaseWorkspace):
                         if optimizer_step_succeeded:
                             self.global_step += 1
 
+                    if abort_for_nonfinite:
+                        raise FloatingPointError(
+                            "Stopped before checkpointing after "
+                            f"{consecutive_nonfinite_updates} consecutive "
+                            "non-finite optimizer updates."
+                        )
+
                     if (
                         cfg.training.max_train_steps is not None
                         and self.global_step >= int(cfg.training.max_train_steps)
@@ -420,7 +556,7 @@ class TrainUnifiedVideoActionWorkspace(BaseWorkspace):
                         stop_training = True
                         break
 
-            train_loss = np.mean(train_losses)
+            train_loss = np.mean(train_losses) if train_losses else float("nan")
             step_log["train_loss"] = train_loss
 
             # ========= eval for this epoch ==========
@@ -432,6 +568,7 @@ class TrainUnifiedVideoActionWorkspace(BaseWorkspace):
 
             # ========= evaluate val video generation =========
             if cfg.model.policy.autoregressive_model_params.predict_video:
+                accelerator.wait_for_everyone()
                 fvd_log = test_video_fvd(
                     cfg,
                     policy,
@@ -439,14 +576,18 @@ class TrainUnifiedVideoActionWorkspace(BaseWorkspace):
                     local_epoch_idx,
                     self.output_dir,
                     device,
+                    save_outputs=accelerator.is_main_process,
                 )
-                step_log.update(fvd_log)
+                if accelerator.is_main_process:
+                    step_log.update(fvd_log)
+                accelerator.wait_for_everyone()
 
             # ========= evaluate val action error =========
             if (
                 cfg.model.policy.action_model_params.predict_action
                 and "env_runner" not in cfg.task
             ):
+                accelerator.wait_for_everyone()
                 ## if has similartor, skip this
                 act_log = test_action_l2(
                     cfg,
@@ -456,7 +597,9 @@ class TrainUnifiedVideoActionWorkspace(BaseWorkspace):
                     self.output_dir,
                     device,
                 )
-                step_log.update(act_log)
+                if accelerator.is_main_process:
+                    step_log.update(act_log)
+                accelerator.wait_for_everyone()
 
             # ========= simulator: run rollout =========
             if rollout_enabled:

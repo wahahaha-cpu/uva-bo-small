@@ -51,9 +51,25 @@ def prepare_data_predict_action(
         different_history_freq=cfg.model.policy.different_history_freq,
     )
 
-    real, _, c, latent_size, proprioception_input = get_vae_latent(
-        x, model.vae_model, eval=True, proprioception_input=proprioception_input
-    )
+    if getattr(model, "use_student_tokenizer", False):
+        c_img, real = torch.chunk(x, 2, dim=2)
+        c, _ = model._encode_student_latent(c_img)
+        latent_size = c.size()[2:]
+
+        if proprioception_input is not None:
+            for image_key, latent_key in (
+                ("second_image", "second_image_z"),
+                ("pred_second_image", "pred_second_image_z"),
+            ):
+                if image_key in proprioception_input:
+                    image_z, _ = model._encode_student_latent(
+                        proprioception_input[image_key]
+                    )
+                    proprioception_input[latent_key] = image_z
+    else:
+        real, _, c, latent_size, proprioception_input = get_vae_latent(
+            x, model.vae_model, eval=True, proprioception_input=proprioception_input
+        )
     history_trajectory, trajectory = get_trajectory(
         nactions,
         T,
@@ -98,7 +114,15 @@ def prepare_data_predict_action(
 
 
 def test_video_fvd(
-    cfg, model, loader, it, output_dir, device, name_label="", plot_actions=False
+    cfg,
+    model,
+    loader,
+    it,
+    output_dir,
+    device,
+    name_label="",
+    plot_actions=False,
+    save_outputs=True,
 ):
     losses = dict()
     losses["fvd"] = AverageMeter()
@@ -160,6 +184,13 @@ def test_video_fvd(
                 cfg, x, actions, model, T, device, language_goal=language_goal
             )
 
+            selected_training_mode = cfg.model.policy.selected_training_mode
+            video_task_mode = (
+                selected_training_mode
+                if selected_training_mode
+                in {"video_model", "dynamic_model", "full_dynamic_model"}
+                else "full_dynamic_model"
+            )
             z, act_out = model.model.sample_tokens(
                 bsz=k,
                 cond=c,
@@ -171,7 +202,7 @@ def test_video_fvd(
                 history_nactions=history_trajectory,
                 nactions=trajectory,
                 proprioception_input=proprioception_input,
-                task_mode="full_dynamic_model",
+                task_mode=video_task_mode,
             )
             pred = decode_from_sample_autoregressive(model.vae_model, z / 0.2325)
             pred = pred.clamp(-1, 1).cpu()
@@ -226,28 +257,28 @@ def test_video_fvd(
     )
     fvd = fvd.item()
 
-    os.makedirs(output_dir + "/vis", exist_ok=True)
-    real_vid = save_image_grid(
-        reals.cpu().numpy(),
-        os.path.join(output_dir, f"vis/{name_label}real_{it}.gif"),
-        drange=[0, 255],
-        grid_size=(reals.size(0) // 4, 4),
-    )  # [4, 3, 8, 128, 128]
-    pred_vid = save_image_grid(
-        predictions.cpu().numpy(),
-        os.path.join(output_dir, f"vis/{name_label}predicted_{it}.gif"),
-        drange=[0, 255],
-        grid_size=(predictions.size(0) // 4, 4),
-    )  # [4, 3, 8, 128, 128]
-
-    real_video = wandb.Video(os.path.join(output_dir, f"vis/{name_label}real_{it}.gif"))
-    pred_video = wandb.Video(
-        os.path.join(output_dir, f"vis/{name_label}predicted_{it}.mp4")
-    )
-
     log_data[f"{name_label}video_fvd"] = fvd
-    log_data[f"{name_label}real_img"] = real_video
-    log_data[f"{name_label}predicted_img"] = pred_video
+    if save_outputs:
+        os.makedirs(output_dir + "/vis", exist_ok=True)
+        save_image_grid(
+            reals.cpu().numpy(),
+            os.path.join(output_dir, f"vis/{name_label}real_{it}.gif"),
+            drange=[0, 255],
+            grid_size=(reals.size(0) // 4, 4),
+        )  # [4, 3, 8, 128, 128]
+        save_image_grid(
+            predictions.cpu().numpy(),
+            os.path.join(output_dir, f"vis/{name_label}predicted_{it}.gif"),
+            drange=[0, 255],
+            grid_size=(predictions.size(0) // 4, 4),
+        )  # [4, 3, 8, 128, 128]
+
+        log_data[f"{name_label}real_img"] = wandb.Video(
+            os.path.join(output_dir, f"vis/{name_label}real_{it}.gif")
+        )
+        log_data[f"{name_label}predicted_img"] = wandb.Video(
+            os.path.join(output_dir, f"vis/{name_label}predicted_{it}.mp4")
+        )
 
     return log_data
 
